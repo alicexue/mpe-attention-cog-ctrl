@@ -1,0 +1,612 @@
+---
+title: "Pupil trial history effects"
+author: "Alice M. Xue (alicexue@stanford.edu)"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 3
+    toc_float:
+      collapsed: no
+    self_contained: true
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+---
+
+```{r setup, include=FALSE}
+library(plyr)
+library(tidymv)
+library(Hmisc)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+library(data.table)
+library(psycho)
+library(lme4)
+library(sjPlot)
+library(afex)
+library(wesanderson)
+library(viridis)
+library(showtext)
+library(tidyverse)
+library(mgcv)
+library(itsadug)
+library(RColorBrewer)
+library(ggcorrplot)
+library(devtools)
+library(factoextra)
+library(tidyjson)
+library(purrr)
+library(broom)
+library(zoo)
+library(psych)
+library(patchwork)
+library(emmeans)
+library(ggpubr)
+library(stats)
+library(broom.mixed)
+library(pracma)
+library(afex)
+library(stringr)
+library(sjlabelled)
+
+font_add(family = "Avenir Next",
+         regular = "../utils/AvenirNext-Regular.ttf",
+         bold = "../utils/AvenirNext-DemiBold.ttf",
+         italic = "../utils/AvenirNext-Italic.ttf")
+showtext.auto()
+op <- showtext_opts()
+
+fontfamily <- "Avenir Next"
+
+set_theme(
+  base=theme_classic(base_size = 12,
+                     base_family="Avenir Next")
+  
+)
+
+options(dplyr.summarise.inform = FALSE)
+
+#knitr::opts_chunk$set(dev = 'pdf') # set output device to pdf
+
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message = FALSE)
+```
+
+```{r, echo=F}
+source("../utils/summary_se_utils.R")
+```
+
+
+```{r labels, echo=F}
+
+palette <- c("#008080", "#9fdfbf")
+hit_miss_palette <- c("#6E9075", "#FC7753")
+
+ret_labels_strong <- tibble(event = c("cue", "delay", "probe", "ITI"),
+                            time = c(0, 1, 2, 2.75))
+
+ret_labels_weak <- tibble(event = c("cue", "delay", "probe", "ITI"),
+                          time = c(0, 1, 2, 2.75))
+
+ret_labels <- rbind(ret_labels_strong, ret_labels_weak)
+ret_labels$position <- 0.12
+
+rainbow <- c("#E82C42", 
+             "#F46D43", 
+             "#FFCC00", 
+             "#29A343", 
+             "#1E8DD2", 
+             "#59169C")
+
+pcs_of_interest <- c(3, 4)
+
+```
+
+```{r, echo=F}
+
+load("pupil_tPCA_correct_only.RData")
+scores <- read.csv("pupil_tPCA_scores_correct_trials_only.csv") %>% 
+  select(-X)
+pca.loadings <- read.csv("pupil_tPCA_loadings_correct_trials_only.csv") %>% 
+  select(-X)
+
+```
+
+```{r get_behavior, echo=F}
+
+set.seed(478)
+
+greek.beta <- "\u03B2"
+
+y_axis_pupil_label = "Pupil diameter (z)"
+
+data_ret <- fread("../../data/behavior/MPE_asso_retrieval_behavior.csv") %>% 
+  mutate(key = match_response.keys,
+         rt = match_response.rt * 1000)
+
+data_recog <- fread("../../data/behavior/MPE_mismatch_recog_behavior.csv") %>% 
+  mutate(rt = recognition_response.rt * 1000)
+
+recognition_behavior <- data_recog %>%
+  mutate(trialN = trials.thisTrialN) %>% 
+  select(trialN,
+         recognition_response.keys,
+         recognition_response.rt,
+         is_old,
+         img,
+         subjectId,
+         expId) %>%
+  mutate(hit = is_old & (recognition_response.keys==1)) %>%
+  mutate(false_alarm = !is_old & (recognition_response.keys==1)) %>%
+  mutate(miss = is_old & (recognition_response.keys==2)) %>%
+  mutate(correct_rejection = !is_old & (recognition_response.keys==2)) %>%
+  mutate(trial_outcome = case_when(hit ~ "Hit",
+                                   false_alarm ~ "FA",
+                                   miss ~ "Miss",
+                                   correct_rejection ~ "CR")) %>%
+  group_by(subjectId,
+           trialN,
+           trial_outcome,
+           is_old,
+           img,
+           recognition_response.keys,
+           expId) %>%
+  summarize(recognition_response.rt = mean(recognition_response.rt)) %>%
+  ungroup() 
+
+```
+
+## Trial history
+
+```{r same_tempPCA_trialhist, echo=F, fig.width=8}
+
+prev_trial_data_ret <- data_ret %>% 
+  mutate(hit = is_match_trial & (match_response.keys==1)) %>%
+  mutate(false_alarm = !is_match_trial & (match_response.keys==1)) %>%
+  mutate(miss = is_match_trial & (match_response.keys==2)) %>%
+  mutate(correct_rejection = !is_match_trial & (match_response.keys==2)) %>%
+  mutate(trial_outcome = case_when(hit ~ "Hit",
+                                   false_alarm ~ "FA",
+                                   miss ~ "Miss",
+                                   correct_rejection ~ "CR")) %>% 
+  group_by(subjectId, block_n) %>% 
+  mutate(trials.thisTrialN = trials.thisTrialN + 1) %>% 
+  mutate(previous_trial_outcome = trial_outcome) %>% 
+  mutate(previous_trial_association_strength = association_strength) %>% 
+  mutate(trialN_block = trials.thisTrialN) %>% 
+  select(subjectId, block_n, trialN_block, 
+         previous_trial_outcome, previous_trial_association_strength)
+
+print(paste("N subjects:", subj.data.scores %>%
+              pull(subjectId) %>%
+              unique() %>% 
+              length()))
+
+```
+
+## Predict next trial outcome
+
+```{r, echo=F}
+get_term_labels <- function(i) {
+  term_labels <- list(
+    `component_score` = paste("PC", i, " score", sep=""),
+    `is_mismatchMismatch` = "Mismatch",
+    `is_incorrectIncorrect` = "Incorrect",
+    `association_strengthWeak (1x)` = "Memory strength (Weak)",
+    `component_score:is_mismatchMismatch` = paste("PC", i, " score x Mismatch", sep=""),
+    `component_score:is_incorrectIncorrect` = paste("PC", i, " score x Incorrect", sep=""),
+    `component_score:association_strengthWeak (1x)` = paste("PC", i, " score x Memory strength", sep=""),
+    `is_mismatchMismatch:is_incorrectIncorrect` = "Mismatch x Incorrect",
+    `is_mismatchMismatch:association_strengthWeak (1x)` = "Mismatch x Memory strength",
+    `is_incorrectIncorrect:association_strengthWeak (1x)` = "Incorrect x Memory strength",
+    `component_score:is_mismatchMismatch:is_incorrectIncorrect` = paste("PC", i, " score x Mismatch x Incorrect", sep=""), 
+    `component_score:is_mismatchMismatch:association_strengthWeak (1x)` = paste("PC", i, " score x Mismatch x Memory strength", sep=""),
+    `component_score:is_incorrectIncorrect:association_strengthWeak (1x)` = paste("PC", i, " score x Incorrect x Memory strength", sep=""),
+    `is_mismatchMismatch:is_incorrectIncorrect:association_strengthWeak (1x)` = "Mismatch x Incorrect x Memory strength",
+    `component_score:is_mismatchMismatch:is_incorrectIncorrect:association_strengthWeak (1x)` = paste("PC", i, " score x Mismatch x Incorrect x Memory strength", sep=""))
+  return(term_labels)
+}
+```
+
+```{r trial_hist_models_outcome_correct, eval=T, echo=F, results="asis", fig.height=3, fig.width=6}
+
+trial_hist_mods.correct <- list()
+
+next_trial_data_ret <- data_ret %>% 
+  mutate(hit = is_match_trial & (match_response.keys==1)) %>%
+  mutate(false_alarm = !is_match_trial & (match_response.keys==1)) %>%
+  mutate(miss = is_match_trial & (match_response.keys==2)) %>%
+  mutate(correct_rejection = !is_match_trial & (match_response.keys==2)) %>%
+  mutate(trial_outcome = case_when(hit ~ "Hit",
+                                   false_alarm ~ "FA",
+                                   miss ~ "Miss",
+                                   correct_rejection ~ "CR")) %>% 
+  group_by(subjectId, block_n) %>% 
+  mutate(trials.thisTrialN = trials.thisTrialN - 1) %>% 
+  mutate(next_trial_outcome = trial_outcome) %>% 
+  mutate(next_trial_rt = log(match_response.rt)) %>% 
+  mutate(next_trial_association_strength = association_strength) %>% 
+  mutate(trialN_block = trials.thisTrialN) %>% 
+  select(subjectId, block_n, trialN_block, next_trial_rt,
+         next_trial_outcome, next_trial_association_strength)
+
+mod.data <- subj.data.scores %>% 
+  mutate(participant_id = subjectId) %>% 
+  left_join(next_trial_data_ret, by=c("participant_id" = "subjectId", 
+                                      "block" = "block_n", 
+                                      "trialN_block")) %>% 
+  dplyr::filter(!is.na(next_trial_outcome)) %>% 
+  mutate(is_mismatch = if_else(trial_outcome %in% c("Hit", "Miss"),
+                               "Match",
+                               "Mismatch")) %>%
+  mutate(is_incorrect = if_else(trial_outcome %in% c("Hit", "CR"),
+                                "Correct",
+                                "Incorrect")) %>%
+  dplyr::filter(is_incorrect == "Correct") %>% 
+  mutate(next_is_mismatch = if_else(next_trial_outcome %in% c("Hit", "Miss"),
+                                    0,
+                                    1)) %>% 
+  mutate(next_is_correct = if_else(next_trial_outcome %in% c("Hit", "CR"),
+                                   1,
+                                   0)) 
+
+```
+
+## Strong CR
+
+### Next trial outcome
+
+```{r trial_hist_models_outcome_strong_cr, eval=T, echo=F, results="asis", fig.height=3, fig.width=6}
+
+trial_hist_mods.correct <- list()
+
+mod.data <- subj.data.scores %>% 
+  mutate(participant_id = subjectId) %>% 
+  left_join(next_trial_data_ret, by=c("participant_id" = "subjectId", 
+                                      "block" = "block_n", 
+                                      "trialN_block")) %>% 
+  dplyr::filter(!is.na(next_trial_outcome)) %>% 
+  mutate(is_mismatch = if_else(trial_outcome %in% c("Hit", "Miss"),
+                               "Match",
+                               "Mismatch")) %>%
+  mutate(is_incorrect = if_else(trial_outcome %in% c("Hit", "CR"),
+                                "Correct",
+                                "Incorrect")) %>%
+  dplyr::filter(trial_outcome == "CR") %>% 
+  dplyr::filter(association_strength == "Strong (4x)") %>% 
+  mutate(next_is_mismatch = if_else(next_trial_outcome %in% c("Hit", "Miss"),
+                                    0,
+                                    1)) %>% 
+  mutate(next_is_correct = if_else(next_trial_outcome %in% c("Hit", "CR"),
+                                   1,
+                                   0)) 
+
+for (i in pcs_of_interest) {
+  trial_hist_mod <- mod.data %>%
+    dplyr::filter(component == paste("PC", i, sep="")) %>% 
+    var_labels(component_score = "PC score",
+               is_mismatch = "Mismatch",
+               is_incorrect = "Inaccurate",
+               association_strength = "Memory strength (Weak v. Strong)") %>%
+    glmer(next_is_correct ~ component_score * next_is_mismatch * next_trial_association_strength + 
+            (1 | subjectId),
+          family = "binomial",
+          control=glmerControl(optimizer="bobyqa",
+                               optCtrl=list(maxfun=2e5)),
+          data = .)
+  
+  if (isSingular(trial_hist_mod) | any(grepl("failed to converge", trial_hist_mod@optinfo$conv$lme4$messages))) {
+    print("MODEL DID NOT CONVERGE")
+  }
+  
+  trial_hist_mods.correct[[i]] <- trial_hist_mod
+}
+# }
+
+```
+
+```{r plot_pred_correct_strong_cr, echo=F, results="asis", fig.width=6, fig.height=3}
+
+for (i in pcs_of_interest) {
+  trial_hist_mod <- trial_hist_mods.correct[[i]]
+  
+  mod.fig <- trial_hist_mod %>% 
+    plot_model(type="pred",
+               terms=c("component_score[all]",
+                       "next_is_mismatch",
+                       "next_trial_association_strength")) +
+    scale_color_manual(values=c("#FFC759", "#D33F49"), name="") +
+    scale_fill_manual(values=c("#FFC759", "#D33F49"), name="") +
+    labs(y = "P(correct on next trial)",
+         x = paste("PC", i, " score", sep="")) +
+    theme(plot.title=element_blank(),
+          strip.text.x = element_text(size=12))
+  
+  (mod.fig) %>% 
+    print()
+  
+  mod.fig <- trial_hist_mod %>% 
+    plot_model(type="pred",
+               terms=c("component_score[all]")) +
+    scale_color_manual(values=c("#FFC759", "#D33F49"), name="") +
+    scale_fill_manual(values=c("#FFC759", "#D33F49"), name="") +
+    labs(y = "P(correct on next trial)",
+         x = paste("PC", i, " score", sep="")) +
+    theme(plot.title=element_blank(),
+          strip.text.x = element_text(size=12))
+  
+  (mod.fig) %>% 
+    print()
+  
+  tidy(trial_hist_mod, effects = "fixed", conf.int = T, conf.level = 0.95, exponentiate=T) %>% 
+    select(term, estimate, conf.low, conf.high, p.value, std.error) %>% 
+    kable(caption=paste("PC", i, ": ", formula(trial_hist_mod)[3], sep=""),
+          digits=3) %>% 
+    kable_styling() %>% 
+    cat()
+  
+  slopes <- emtrends(trial_hist_mod, pairwise ~ next_is_mismatch * next_trial_association_strength, var = "component_score")
+  
+  tidy(slopes$emtrends, conf.int = T, conf.level = 0.95) %>% 
+    kable(caption=paste("slopes", sep=""),
+          digits=3) %>% 
+    kable_styling() %>% 
+    cat()
+  
+  tidy(slopes$contrasts, conf.int = T, conf.level = 0.95) %>% 
+    select(contrast, estimate, std.error, df, conf.low, conf.high, statistic, adj.p.value) %>% 
+    kable(caption=paste("slope contrasts", sep=""),
+          digits=3) %>% 
+    kable_styling() %>% 
+    cat()
+  
+  tidy(trial_hist_mod, effects = "ran_pars", scales = "vcov") %>% 
+    select(term, estimate) %>% 
+    kable(digits=3, caption="Random effects") %>% 
+    kable_styling() %>% 
+    cat()
+}
+```
+
+```{r plot_coef_correct_strong_cr, eval=F, echo=F, results="asis"}
+
+for (i in pcs_of_interest) {
+  trial_hist_mod <- trial_hist_mods.correct[[i]]
+  
+  term_labels <- get_term_labels(i)
+  
+  (trial_hist_mod %>% 
+      plot_model(sort.est = TRUE, 
+                 transform = "plogis", 
+                 show.values = TRUE, 
+                 value.offset = 0.4, 
+                 title = "Correct on next trial",
+                 axis.labels = ""
+      ) + 
+      scale_x_discrete(labels=term_labels)) %>% 
+    print()
+  
+  (trial_hist_mod %>% 
+      plot_model(sort.est = TRUE, 
+                 # transform = "plogis", 
+                 show.values = TRUE, 
+                 value.offset = 0.4, 
+                 palette = c("#D64933", "#4D9DE0"),
+                 title = "Correct on next trial",
+                 axis.labels = ""
+      ) + 
+      scale_x_discrete(labels=term_labels)) %>% 
+    print()
+}
+
+```
+
+## PC score correlations
+
+```{r score_corr_trial_history, echo=F, results="asis"}
+
+prev.scores <- scores %>% 
+  mutate(prev_trialN_block = trialN_block) %>% 
+  mutate(prev_trial_outcome = trial_outcome) %>% 
+  mutate(prev_association_strength = association_strength) %>% 
+  mutate(trialN_block = trialN_block + 1) %>%
+  select(subjectId, 
+         component, 
+         trialN_block, 
+         block, 
+         prev_trialN_block, 
+         prev_trial_outcome,
+         prev_association_strength,
+         component_score)
+
+
+scores.w.prevTrial <- scores %>% 
+  left_join(prev.scores, by=c("subjectId", 
+                              "component", 
+                              "trialN_block",
+                              "block"),
+            suffix = c(".currTrial", ".prevTrial")) %>% 
+  dplyr::filter(!is.na(component_score.prevTrial))
+
+mod.data <- scores.w.prevTrial %>% 
+  pivot_wider(names_from = c("component"),
+              values_from = c("component_score.currTrial", "component_score.prevTrial")) %>% 
+  mutate(is_mismatch = if_else(trial_outcome %in% c("Hit", "Miss"),
+                               0,
+                               1)) %>%
+  mutate(is_incorrect = if_else(trial_outcome %in% c("Hit", "CR"),
+                                0,
+                                1)) %>% 
+  mutate(prev_is_mismatch = if_else(prev_trial_outcome %in% c("Hit", "Miss"),
+                                    0,
+                                    1)) %>%
+  mutate(prev_is_incorrect = if_else(prev_trial_outcome %in% c("Hit", "CR"),
+                                     0,
+                                     1))
+
+pc.first <- "PC2"
+pc.second <- "PC3"
+
+pc.first <- paste("component_score.currTrial", pc.first, sep="_")
+pc.second <- paste("component_score.prevTrial", pc.second, sep="_")
+
+mod.formula <- as.formula(paste(pc.first,
+                                "~", 
+                                pc.second, 
+                                " * prev_is_mismatch * prev_is_incorrect * prev_association_strength + (",
+                                pc.second, 
+                                " + prev_is_mismatch + prev_is_incorrect + prev_association_strength", 
+                                "|", "subjectId)"))
+
+mod <- mod.data %>%
+  lmer(mod.formula, data = .)
+
+if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+  mod.formula <- as.formula(paste(pc.first,
+                                  "~", 
+                                  pc.second, 
+                                  " * prev_is_mismatch * prev_is_incorrect * prev_association_strength + (",
+                                  pc.second, 
+                                  "|", "subjectId)"))
+  
+  mod <- mod.data %>%
+    lmer(mod.formula, data = .)
+}
+
+if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+  mod.formula <- as.formula(paste(pc.first, "~", pc.second, " * prev_is_mismatch * prev_is_incorrect * prev_association_strength + (1|", "subjectId)"))
+  
+  mod <- mod.data %>%
+    lmer(mod.formula, data = .)
+}
+
+tidy(mod, effects = "fixed", conf.int = T, conf.level = 0.95) %>% 
+  select(term, estimate, conf.low, conf.high, p.value, std.error, df) %>% 
+  kable(caption=paste(deparse(mod.formula), sep="", collapse=""),
+        digits=3) %>% 
+  kable_styling() %>% 
+  cat()
+
+slopes <- emtrends(mod, pairwise ~  prev_is_mismatch * prev_is_incorrect * prev_association_strength, var = pc.second)
+
+tidy(slopes$emtrends, conf.int = T, conf.level = 0.95) %>% 
+  kable(caption=paste("slopes", sep=""),
+        digits=3) %>% 
+  kable_styling() %>% 
+  cat()
+
+tidy(slopes$contrasts, conf.int = T, conf.level = 0.95) %>% 
+  select(contrast, estimate, std.error, df, conf.low, conf.high, statistic, adj.p.value) %>% 
+  kable(caption=paste("slope contrasts", sep=""),
+        digits=3) %>% 
+  kable_styling() %>% 
+  cat()
+
+###
+
+pc.first <- "PC2"
+pc.second <- "PC4"
+
+pc.first <- paste("component_score.currTrial", pc.first, sep="_")
+pc.second <- paste("component_score.prevTrial", pc.second, sep="_")
+
+mod.formula <- as.formula(paste(pc.first,
+                                "~", 
+                                pc.second, 
+                                " * prev_is_mismatch * prev_is_incorrect * prev_association_strength + (",
+                                pc.second, 
+                                " * prev_is_mismatch * prev_is_incorrect * prev_association_strength", 
+                                "|", "subjectId)"))
+
+mod <- mod.data %>%
+  lmer(mod.formula, data = .)
+
+mod.formula <- as.formula(paste(pc.first,
+                                "~", 
+                                pc.second, 
+                                " * prev_is_mismatch * prev_is_incorrect * prev_association_strength + (",
+                                pc.second, 
+                                "|", "subjectId)"))
+
+mod <- mod.data %>%
+  lmer(mod.formula, data = .)
+
+if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+  mod.formula <- as.formula(paste(pc.first, "~", pc.second, " * prev_is_mismatch * prev_is_incorrect * prev_association_strength + (1|", "subjectId)"))
+  
+  mod <- mod.data %>%
+    lmer(mod.formula, data = .)
+}
+
+tidy(mod, effects = "fixed", conf.int = T, conf.level = 0.95) %>% 
+  select(term, estimate, conf.low, conf.high, p.value, std.error, df) %>% 
+  kable(caption=paste(deparse(mod.formula), sep="", collapse=""),
+        digits=3) %>% 
+  kable_styling() %>% 
+  cat()
+
+mod %>% 
+  plot_model(type="pred",
+             terms=c(paste(pc.second, "[all]", sep=""),
+                     "prev_is_mismatch",
+                     "prev_is_incorrect"))
+
+slopes <- emtrends(mod, pairwise ~  prev_is_mismatch * prev_is_incorrect * prev_association_strength, var = pc.second)
+
+tidy(slopes$emtrends, conf.int = T, conf.level = 0.95) %>% 
+  kable(caption=paste("slopes", sep=""),
+        digits=3) %>% 
+  kable_styling() %>% 
+  cat()
+
+tidy(slopes$contrasts, conf.int = T, conf.level = 0.95) %>% 
+  select(contrast, estimate, std.error, df, conf.low, conf.high, statistic, adj.p.value) %>% 
+  kable(caption=paste("slope contrasts", sep=""),
+        digits=3) %>% 
+  kable_styling() %>% 
+  cat()
+
+```
+
+##### PC2 ~ previous trial
+
+```{r pc2_as_predicted_by_prev_trial, eval=F, echo=F, results="asis"}
+
+pc.first <- "PC2"
+pc.second <- "PC4"
+
+pc.first <- paste("component_score.currTrial", pc.first, sep="_")
+pc.second <- paste("component_score.prevTrial", pc.second, sep="_")
+
+mod.formula <- as.formula(paste(pc.first,
+                                "~", 
+                                "prev_is_mismatch * prev_is_incorrect * prev_association_strength + (",
+                                "prev_is_mismatch * prev_is_incorrect * prev_association_strength", 
+                                "|", "subjectId)"))
+
+mod <- mod.data %>%
+  lmer(mod.formula, data = .)
+
+mod.formula <- as.formula(paste(pc.first,
+                                "~", 
+                                "prev_is_mismatch * prev_is_incorrect * prev_association_strength + ( 1",
+                                "|", "subjectId)"))
+
+mod <- mod.data %>%
+  lmer(mod.formula, data = .)
+
+if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+  mod.formula <- as.formula(paste(pc.first, "~", "prev_is_mismatch * prev_is_incorrect * prev_association_strength + (1|", "subjectId)"))
+  
+  mod <- mod.data %>%
+    lmer(mod.formula, data = .)
+}
+
+tidy(mod, effects = "fixed", conf.int = T, conf.level = 0.95) %>% 
+  select(term, estimate, conf.low, conf.high, p.value, std.error, df) %>% 
+  kable(caption=paste(deparse(mod.formula), sep="", collapse=""),
+        digits=3) %>% 
+  kable_styling() %>% 
+  cat()
+```

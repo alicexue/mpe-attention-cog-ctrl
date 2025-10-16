@@ -1,0 +1,2059 @@
+---
+title: "Pupil timeseries during associative retrieval"
+author: "Alice Xue"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+params:
+    run_models: yes
+output:
+  html_document:
+    toc: yes
+    toc_depth: 3
+    toc_float:
+      collapsed: no
+    self_contained: true
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+---
+
+```{r setup, include=FALSE}
+library(plyr)
+library(tidymv)
+library(Hmisc)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+library(data.table)
+library(psycho)
+library(lme4)
+library(sjPlot)
+library(afex)
+library(wesanderson)
+library(viridis)
+library(showtext)
+library(tidyverse)
+library(mgcv)
+library(itsadug)
+library(RColorBrewer)
+library(ggcorrplot)
+library(devtools)
+library(factoextra)
+library(tidyjson)
+library(purrr)
+library(broom)
+library(zoo)
+library(psych)
+library(patchwork)
+library(emmeans)
+library(ggpubr)
+library(stats)
+library(broom.mixed)
+library(pracma)
+library(afex)
+library(stringr)
+library(modelr)
+library(fuzzyjoin)
+
+font_add(family = "Avenir Next",
+         regular = "../utils/AvenirNext-Regular.ttf",
+         bold = "../utils/AvenirNext-DemiBold.ttf",
+         italic = "../utils/AvenirNext-Italic.ttf")
+showtext.auto()
+op <- showtext_opts()
+
+fontfamily <- "Avenir Next"
+
+set_theme(
+  base=theme_classic(base_size = 12,
+                     base_family="Avenir Next")
+  
+)
+
+options(dplyr.summarise.inform = FALSE)
+
+#knitr::opts_chunk$set(dev = 'pdf') # set output device to pdf
+
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message = FALSE)
+```
+
+```{r, echo=F}
+source("../utils/summary_se_utils.R")
+```
+
+```{r get_behavior, echo=F}
+
+set.seed(478)
+
+greek.beta <- "\u03B2"
+
+run_models <- params$run_models
+
+y_axis_pupil_label = "Pupil diameter (z)"
+
+data_ret <- fread("../../data/behavior/MPE_asso_retrieval_behavior.csv") %>% 
+  mutate(key = match_response.keys,
+         rt = match_response.rt * 1000)
+
+data_recog <- fread("../../data/behavior/MPE_mismatch_recog_behavior.csv") %>% 
+  mutate(rt = recognition_response.rt * 1000)
+
+recognition_behavior <- data_recog %>%
+  mutate(trialN = trials.thisTrialN) %>% 
+  select(trialN,
+         recognition_response.keys,
+         recognition_response.rt,
+         is_old,
+         img,
+         subjectId,
+         expId) %>%
+  mutate(hit = is_old & (recognition_response.keys==1)) %>%
+  mutate(false_alarm = !is_old & (recognition_response.keys==1)) %>%
+  mutate(miss = is_old & (recognition_response.keys==2)) %>%
+  mutate(correct_rejection = !is_old & (recognition_response.keys==2)) %>%
+  mutate(trial_outcome = case_when(hit ~ "Hit",
+                                   false_alarm ~ "FA",
+                                   miss ~ "Miss",
+                                   correct_rejection ~ "CR")) %>%
+  group_by(subjectId,
+           trialN,
+           trial_outcome,
+           is_old,
+           img,
+           recognition_response.keys,
+           expId) %>%
+  summarize(recognition_response.rt = mean(recognition_response.rt)) %>%
+  ungroup() 
+
+```
+
+```{r save_or_load_data, echo=F}
+retrieval_pupil <- fread("../../data/pupil/MPE_imm_retrieval_pupil.csv") 
+
+retrieval_pupil.del <- fread("../../data/pupil/MPE_del_retrieval_pupil.csv") 
+
+retrieval_pupil <- bind_rows(retrieval_pupil, retrieval_pupil.del) %>% 
+  mutate(expId = case_when(grepl("MPE1", subjectId) ~ "imm",
+                           grepl("MPE3", subjectId) ~ "del",
+                           grepl("MPE5", subjectId) ~ "del")) %>%
+  mutate(across(expId, 
+                factor, 
+                levels=c("imm", "del"))) %>% 
+  mutate(room_setup = case_when(grepl("MPE1", subjectId) ~ "1", # eeg + pupil, shared-eeg lab
+                                grepl("MPE3", subjectId) ~ "2", # pupil only, shared-eeg lab
+                                grepl("MPE5", subjectId) ~ "3")) # pupil only, 4th floor lab
+
+subs.exclude <- c("MPE514", "MPE527") # models did not converge for these subjects
+```
+
+```{r labels, echo=F}
+
+palette <- c("#008080", "#9fdfbf")
+beta_palette <- c("#A7A2A9", "#9E0059", "#1A936F", "#FFD131")
+hit_miss_palette <- c("#6E9075", "#FC7753")
+submem.beta_palette <- c("#A7A2A9", "#9C528B", "#1A936F", "#190E4F")
+blue_ornge_rep_palette <- c("#1a75ff", "#ff751a", "#1a75ff", "#ff751a")
+
+sfreq <- 0.01
+
+ret_labels_strong <- tibble(event = c("cue", "delay", "probe", "ITI"),
+                            time = c(0, 1, 2, 2.75))
+
+ret_labels_weak <- tibble(event = c("cue", "delay", "probe", "ITI"),
+                          time = c(0, 1, 2, 2.75))
+
+ret_labels <- rbind(ret_labels_strong, ret_labels_weak)
+ret_labels$position <- 0.12
+```
+
+## Associative retrieval
+
+### Betas
+
+```{r, echo=F}
+
+level_order <- c("Match",  "Mismatch", "Miss (match)", "False alarm (mismatch)")
+
+pupil_summarized <- retrieval_pupil %>% 
+  mutate(trial_outcome = case_when(hit ~ "Match",
+                                   false_alarm ~ "False alarm (mismatch)",
+                                   miss ~ "Miss (match)",
+                                   correct_rejection ~ "Mismatch")) %>%
+  dplyr::filter(trial_outcome %in% c("Match", 
+                                     "False alarm (mismatch)", 
+                                     "Miss (match)", 
+                                     "Mismatch")) %>% 
+  group_by(time,
+           subjectId,
+           association_strength,
+           customlinetype,
+           trial_outcome) %>% 
+  summarize(pupil_diameter_z = mean(pupil_diameter_z)) %>% 
+  ungroup() 
+
+```
+
+```{r get_betas, echo=F}
+
+compute_betas <- T
+
+if (compute_betas) {
+  pupil.betas <- retrieval_pupil %>%
+    dplyr::filter(! subjectId %in% subs.exclude) %>% 
+    dplyr::filter(!is_incorrect) %>% 
+    group_by(subjectId, time) %>% 
+    group_modify(~ tidy(lm(pupil_diameter_z ~ association_strength * is_mismatch, 
+                           data = .x)))
+} else {
+  load("pupil_betas.RData")
+}
+
+print(paste("N subjects:", 
+            length(pupil.betas %>% pull(subjectId) %>% unique())))
+
+```
+
+```{r plot_betas, echo=F, fig.width=4, fig.height=7, results="asis"}
+betas.df <- pupil.betas %>% 
+  group_by(time, term) %>% 
+  summarize(se = sd(estimate) / sqrt(sum(!is.na(estimate))),
+            estimate = mean(estimate)) %>% 
+  ungroup() %>% 
+  mutate(term = case_when(term == "association_strengthWeak (1x)" ~ "Memory strength (Weak v. Strong)",
+                          term == "association_strengthWeak (1x):is_mismatch" ~ "Mismatch effect x Memory strength",
+                          term == "is_mismatch" ~ "Mismatch v. Match",
+                          term == "(Intercept)" ~ "Intercept",
+                          .default="")) %>% 
+  dplyr::filter(term != "") %>% 
+  mutate(across(term,
+                factor,
+                levels = c("Intercept",
+                           "Mismatch v. Match",
+                           "Memory strength (Weak v. Strong)",
+                           "Mismatch effect x Memory strength")))
+
+results.betas <- pupil.betas %>% 
+  group_by(time, term) %>% 
+  summarise(t_test = list(t.test(estimate))) %>%
+  mutate(
+    t_statistic = sapply(t_test, function(x) x$statistic),
+    p_value = sapply(t_test, function(x) x$p.value),
+    conf_int_lower = sapply(t_test, function(x) x$conf.int[1]),
+    conf_int_upper = sapply(t_test, function(x) x$conf.int[2])
+  ) %>%
+  select(-t_test) %>% 
+  mutate(p.adj = p_value) %>% 
+  ungroup()
+
+results.betas <- results.betas %>%
+  dplyr::filter(p.adj < 0.05) %>% 
+  mutate(ypos = case_when(term == "association_strengthWeak (1x)" ~ -0.3,
+                          term == "association_strengthWeak (1x):is_mismatch" ~ -0.6,
+                          term == "is_mismatch" ~ -0.1,
+                          .default=0)) %>% 
+  mutate(term = case_when(term == "association_strengthWeak (1x)" ~ "Memory strength (Weak v. Strong)",
+                          term == "association_strengthWeak (1x):is_mismatch" ~ "Mismatch effect x Memory strength",
+                          term == "is_mismatch" ~ "Mismatch v. Match",
+                          .default="")) %>% 
+  dplyr::filter(term != "") %>% 
+  mutate(across(term,
+                factor,
+                level=c("Mismatch v. Match",
+                        "Memory strength (Weak v. Strong)",
+                        "Mismatch effect x Memory strength")))
+
+
+clusters <- results.betas %>% 
+  group_by(term) %>% 
+  mutate(time_diff = c(NA, diff(time))) %>% 
+  mutate(time_diff_back = lead(time_diff)) %>% 
+  mutate(time_diff = round(time_diff, 2),
+         time_diff_back = round(time_diff_back, 2)) %>% 
+  dplyr::filter(time_diff > sfreq | time_diff_back > sfreq | is.na(time_diff) | is.na(time_diff_back)) %>% 
+  ungroup() %>% 
+  select(term, time, time_diff, time_diff_back) %>% 
+  arrange(term, time) %>% 
+  mutate(is_solo_point = ifelse(is.na(time_diff) & time_diff_back > sfreq, T, F)) %>% 
+  group_by(term, is_solo_point) %>% 
+  mutate(index_parity = if_else(row_number() %% 2 == 1, "start", "end")) %>% 
+  mutate(time_period = round(row_number()+1/2) / 2) %>% 
+  ungroup() %>% 
+  select(-time_diff, -time_diff_back) %>% 
+  pivot_wider(names_from=c("index_parity"),
+              values_from = "time") %>% 
+  select(-time_period, -is_solo_point) %>% 
+  mutate(cluster_size = end-start) %>% 
+  mutate(cluster_id = row_number())
+
+if (!"cluster.id" %in% colnames(results.betas) | compute_betas) {
+  results.betas <- fuzzy_left_join(
+    results.betas, 
+    clusters %>% 
+      mutate(term = as.character(term)) %>% 
+      rename(cluster.term = term),
+    by = c("time" = "start", "time" = "end", "term" = "cluster.term"),
+    match_fun = list(`>=`, `<=`, `==`)
+  ) %>% 
+    dplyr::filter(!is.na(cluster_id))
+}
+
+cluster_beta_means <- fuzzy_left_join(
+  pupil.betas %>% 
+    mutate(term = case_when(term == "association_strengthWeak (1x)" ~ "Memory strength (Weak v. Strong)",
+                            term == "association_strengthWeak (1x):is_mismatch" ~ "Mismatch effect x Memory strength",
+                            term == "is_mismatch" ~ "Mismatch v. Match",
+                            term == "(Intercept)" ~ "Intercept",
+                            .default="")), 
+  clusters %>% 
+    mutate(term = as.character(term)) %>% 
+    rename(cluster.term = term),
+  by = c("time" = "start", "time" = "end", "term" = "cluster.term"),
+  match_fun = list(`>=`, `<=`, `==`)
+) %>% 
+  dplyr::filter(!is.na(cluster_id))
+
+subj.cluster_beta_means <- cluster_beta_means
+
+clusters %>% 
+  left_join(
+    cluster_beta_means %>% 
+      group_by(subjectId, cluster_id) %>% 
+      summarize(beta = mean(estimate)) %>% 
+      group_by(cluster_id) %>% 
+      summarize(mean_beta = mean(beta),
+                se = sd(beta) / sqrt(n()),
+                lower_ci = mean_beta - 1.96 * se,
+                upper_ci = mean_beta + 1.96 * se
+      ) %>% 
+      select(-se), 
+    by = "cluster_id") %>% 
+  kable(digits=2) %>% 
+  kable_styling()
+
+stim.locked.clusters <- clusters
+
+```
+
+```{r beta_joint_plt, echo=F, fig.width=4, fig.height=8}
+timeseries.plt <- pupil_summarized %>% 
+  summarySEwithin(.,
+                  measurevar="pupil_diameter_z",
+                  withinvars=c("association_strength",
+                               "trial_outcome",
+                               "time"),
+                  idvar="subjectId") %>%
+  mutate(customlinetype = ifelse(trial_outcome %in% c("Match", "Mismatch"),
+                                 0,
+                                 1)) %>% 
+  mutate(across(trial_outcome,
+                factor,
+                levels = level_order)) %>% 
+  dplyr::filter(trial_outcome %in% c("Match", "Mismatch")) %>% 
+  mutate(trial_type = ifelse(trial_outcome %in% c("Match", "Miss (match)"), 
+                             "Match", "Mismatch")) %>%
+  ggplot(aes(x = as.numeric(as.character(time)), 
+             y = pupil_diameter_z,
+             color = trial_type,
+             fill = trial_type)) +
+  geom_ribbon(aes(ymin=pupil_diameter_z-se, ymax=pupil_diameter_z+se),
+              color=NA,
+              alpha=0.3) +
+  geom_line(aes(linetype = factor(customlinetype)),
+            linewidth = 1) +
+  geom_vline(xintercept = c(0, 1, 2, 2.75),
+             linetype = "dashed",
+             color = "gray37") +
+  labs(x = "Time (s)",
+       y = "Pupil diameter (z)",
+       title = "") +
+  facet_grid(cols = vars(association_strength)) +
+  guides(linetype = "none") + 
+  scale_color_manual(values=blue_ornge_rep_palette, name="") + 
+  scale_fill_manual(values=blue_ornge_rep_palette, name="") + 
+  theme(strip.text.x = element_text(size=12),
+        strip.text.y = element_text(size=12),
+        plot.title = element_blank())
+
+```
+
+
+```{r, echo=F, fig.width=8}
+
+beta.no.intercept.plt <- betas.df %>% 
+  dplyr::filter(term != "Intercept") %>% 
+  ggplot(aes(x=as.numeric(as.character(time)), 
+             y=estimate,
+             color=term,
+             fill=term)) + 
+  geom_ribbon(aes(ymin=estimate-se, ymax=estimate+se),
+              color=NA,
+              alpha=0.3) +
+  geom_line(linewidth = 1) +
+  geom_vline(xintercept = c(0, 1, 2, 2.75),
+             linetype = "dashed",
+             color = "gray37") +
+  geom_hline(yintercept = c(0),
+             linetype = "longdash",
+             color = "gray37") +
+  # mark significant difference
+  geom_point(aes(x = time,
+                 y = ypos,
+                 color=term),
+             show.legend = F,
+             data = results.betas,
+             size = 0.3) +
+  labs(x = "Time (s)",
+       y = paste("Pupil", greek.beta, "weights (a.u.)"),
+       title = "") +
+  geom_text(aes(label = event,
+                x = time,
+                y = 0.3),
+            data = ret_labels,
+            inherit.aes = FALSE,
+            angle = 90, 
+            hjust = 1,
+            vjust = 1.3,
+            size = 3.5,
+            colour = "gray37",
+            family = fontfamily) + 
+  guides(color="none",
+         fill="none") + 
+  facet_wrap(~term, ncol=1, scales="free_y", strip.position="top") +
+  scale_color_manual(values=beta_palette[2:4], name="") + 
+  scale_fill_manual(values=beta_palette[2:4], name="") + 
+  theme(strip.text.x = element_text(size=12),
+        plot.title = element_blank())
+
+timeseries.plt <- pupil_summarized %>% 
+  summarySEwithin(.,
+                  measurevar="pupil_diameter_z",
+                  withinvars=c("association_strength",
+                               "trial_outcome",
+                               "time"),
+                  idvar="subjectId") %>%
+  mutate(customlinetype = ifelse(trial_outcome %in% c("Match", "Mismatch"),
+                                 0,
+                                 1)) %>% 
+  mutate(across(trial_outcome,
+                factor,
+                levels = level_order)) %>% 
+  dplyr::filter(trial_outcome %in% c("Match", "Mismatch")) %>% 
+  mutate(trial_type = ifelse(trial_outcome %in% c("Match", "Miss (match)"), 
+                             "Match", "Mismatch")) %>%
+  ggplot(aes(x = as.numeric(as.character(time)), 
+             y = pupil_diameter_z,
+             color = trial_type,
+             fill = trial_type)) +
+  geom_ribbon(aes(ymin=pupil_diameter_z-se, ymax=pupil_diameter_z+se),
+              color=NA,
+              alpha=0.3) +
+  geom_line(aes(linetype = factor(customlinetype)),
+            linewidth = 1) +
+  geom_vline(xintercept = c(0, 1, 2, 2.75),
+             linetype = "dashed",
+             color = "gray37") +
+  labs(x = "Time (s)",
+       y = "Pupil diameter (z)",
+       title = "") +
+  facet_wrap(~association_strength, ncol=1, strip.position="top") +
+  geom_text(aes(label = event,
+                x = time,
+                y = 0.6),
+            data = ret_labels,
+            inherit.aes = FALSE,
+            angle = 90,
+            hjust = 1,
+            vjust = 1.3,
+            size = 3.5,
+            colour = "gray37",
+            family = fontfamily) +
+  guides(linetype = "none") + 
+  scale_color_manual(values=blue_ornge_rep_palette, name="") + 
+  scale_fill_manual(values=blue_ornge_rep_palette, name="") + 
+  theme(strip.text.x = element_text(size=12),
+        strip.text.y = element_text(size=12),
+        plot.title = element_blank())
+
+timeseries.plt +
+  beta.no.intercept.plt + 
+  plot_layout(widths = c(10, 10),
+              guides = "collect") & theme(legend.position = "top")
+
+```
+
+
+#### Cluster correction
+
+```{r permute, eval=T, echo=F}
+n_permutations <- 1000
+
+run_permutation_test <- T
+
+if (run_permutation_test) {
+  permute_betas <- function(data, n_permutations) {
+    results <- replicate(n_permutations, {
+      permuted_data <- data %>%
+        mutate(estimate = estimate * sample(c(-1, 1), n(), replace = TRUE))
+    }, simplify = FALSE)
+    bind_rows(results, .id = "permutation")
+  }
+  
+  betas.permuted <- pupil.betas %>%
+    group_by(subjectId, term) %>%
+    group_modify(~ permute_betas(.x, n_permutations = n_permutations)) %>%
+    ungroup() 
+  
+  tstats.permuted <- betas.permuted %>% 
+    group_by(permutation, time, term) %>% 
+    summarise(t_test = list(t.test(estimate))) %>%
+    mutate(
+      t_statistic = sapply(t_test, function(x) x$statistic),
+      p_value = sapply(t_test, function(x) x$p.value),
+      conf_int_lower = sapply(t_test, function(x) x$conf.int[1]),
+      conf_int_upper = sapply(t_test, function(x) x$conf.int[2])
+    ) %>%
+    select(-t_test) %>% 
+    mutate(p.adj = p_value) %>% 
+    ungroup() %>% 
+    dplyr::filter(p.adj < 0.05) %>% 
+    mutate(term = case_when(term == "association_strengthWeak (1x)" ~ "Memory strength (Weak v. Strong)",
+                            term == "association_strengthWeak (1x):is_mismatch" ~ "Mismatch effect x Memory strength",
+                            term == "is_mismatch" ~ "Mismatch v. Match",
+                            .default="")) %>% 
+    dplyr::filter(term != "") %>% 
+    mutate(across(term,
+                  factor,
+                  level=c("Mismatch v. Match",
+                          "Memory strength (Weak v. Strong)",
+                          "Mismatch effect x Memory strength")))
+  
+  tstats.permuted.clusters <- tstats.permuted %>% 
+    group_by(permutation, term) %>% 
+    mutate(time_diff = c(NA, diff(time))) %>% 
+    mutate(time_diff_back = lead(time_diff)) %>% 
+    mutate(time_diff = round(time_diff, 2),
+           time_diff_back = round(time_diff_back, 2)) %>% 
+    dplyr::filter(time_diff > sfreq | time_diff_back > sfreq | is.na(time_diff) | is.na(time_diff_back)) %>% 
+    ungroup() %>% 
+    select(permutation, term, time, time_diff, time_diff_back) %>% 
+    arrange(permutation, term, time) %>% 
+    dplyr::filter(time_diff_back == sfreq | time_diff == sfreq) %>% 
+    mutate(is_solo_point = ifelse(is.na(time_diff) & time_diff_back > sfreq, T, F)) %>% 
+    group_by(permutation, term, is_solo_point) %>% 
+    mutate(index_parity = if_else(row_number() %% 2 == 1, "start", "end")) %>% 
+    mutate(time_period = round(row_number()+1/2) / 2) %>% 
+    ungroup() %>% 
+    select(-time_diff, -time_diff_back) %>% 
+    pivot_wider(names_from=c("index_parity"),
+                values_from = "time") %>% 
+    select(-time_period, -is_solo_point) %>% 
+    mutate(cluster_size = end-start) %>% 
+    dplyr::filter(!is.na(cluster_size)) %>% 
+    # check if t-values within suspected clusters have same sign (need contiguous clusters)
+    left_join(tstats.permuted %>% 
+                select(permutation, time, term, t_statistic),
+              by = c("permutation", "term"),
+              multiple = "all",
+              relationship="many-to-many") %>% 
+    dplyr::filter((time >= start) & (time <= end)) %>% 
+    mutate(t_stat_is_positive = sign(t_statistic) == 1) %>%
+    group_by(permutation, term, start, end, cluster_size) %>%
+    # checking sign of start and end points
+    summarize(n_timepoints = n(),
+              t_stat_same_sign = mean(t_stat_is_positive),
+              t_stat_same_sign = t_stat_same_sign %in% c(0, 1)) %>%
+    ungroup() %>%
+    # select clusters where t stats at the start and end are the same (otherwise not a contiguous cluster)
+    dplyr::filter(t_stat_same_sign) %>% 
+    left_join(clusters,
+              by = c("term"),
+              suffix = c(".permuted", ""),
+              multiple="all",
+              relationship="many-to-many") %>% 
+    mutate(larger_than_real_cluster = cluster_size.permuted > cluster_size) %>% 
+    group_by(permutation, term, cluster_id) %>% 
+    summarize(has_larger_cluster = max(larger_than_real_cluster)) %>% 
+    ungroup()
+}
+
+tstats.permuted.clusters %>% 
+  group_by(cluster_id, term) %>% 
+  summarize(
+    n.permutations.with.clusters = n(),
+    permuted.p.value = sum(has_larger_cluster)/n_permutations) %>% 
+  kable() %>% 
+  kable_styling()
+```
+
+## Response-locked time series
+
+```{r rt_locked_time_series, echo=F, fig.width=6, fig.height=3}
+time.around.rt <- 1
+
+rt.locked.data <- retrieval_pupil %>% 
+  filter(! subjectId %in% subs.exclude) %>% 
+  mutate(match_response.rt = round(match_response.rt, 2)) %>% 
+  mutate(time.since.rt = time - match_response.rt - 2) %>% 
+  mutate(time.since.rt = round(time.since.rt, 2)) %>% 
+  mutate(trial_outcome = case_when(hit ~ "Match",
+                                   false_alarm ~ "False alarm (mismatch)",
+                                   miss ~ "Miss (match)",
+                                   correct_rejection ~ "Mismatch")) %>%
+  dplyr::filter(trial_outcome %in% c("Match", 
+                                     "False alarm (mismatch)", 
+                                     "Miss (match)", 
+                                     "Mismatch"))
+
+rt.locked.data.summary <- rt.locked.data %>% 
+  group_by(time.since.rt,
+           subjectId,
+           association_strength,
+           customlinetype,
+           trial_outcome) %>% 
+  summarize(pupil_diameter_z = mean(pupil_diameter_z)) %>% 
+  ungroup() 
+
+rt.locked.plt <- rt.locked.data.summary %>% 
+  mutate(time = time.since.rt) %>% 
+  dplyr::filter(time > -time.around.rt & time < time.around.rt) %>% 
+  summarySEwithin(.,
+                  measurevar="pupil_diameter_z",
+                  withinvars=c("association_strength",
+                               "trial_outcome",
+                               "time"),
+                  idvar="subjectId") %>%
+  mutate(correct = ifelse(trial_outcome %in% c("Match", "Mismatch"), 
+                          "Correct", "Incorrect")) %>% 
+  mutate(customlinetype = ifelse(trial_outcome %in% c("Match", "Mismatch"),
+                                 0,
+                                 1)) %>% 
+  mutate(across(trial_outcome,
+                factor,
+                levels = level_order)) %>% 
+  mutate(trial_type = ifelse(trial_outcome %in% c("Match", "Miss (match)"), 
+                             "Match", "Mismatch")) %>%
+  dplyr::filter(trial_outcome %in% c("Match", "Mismatch")) %>% 
+  ggplot(aes(x = as.numeric(as.character(time)), 
+             y = pupil_diameter_z,
+             color = trial_type,
+             fill = trial_type)) +
+  geom_ribbon(aes(ymin=pupil_diameter_z-se, ymax=pupil_diameter_z+se),
+              color=NA,
+              alpha=0.3) +
+  geom_line(aes(linetype = factor(customlinetype)),
+            linewidth = 1) +
+  geom_vline(xintercept = c(0),
+             linetype = "dashed",
+             color = "gray37") +
+  labs(x = "Time since response (s)",
+       y = "Pupil diameter (z)",
+       title = "") +
+  facet_grid(cols = vars(association_strength)) +
+  guides(linetype = "none") + 
+  scale_x_continuous(breaks=c(-1, 0, 1)) + 
+  scale_color_manual(values=blue_ornge_rep_palette, name="") + 
+  scale_fill_manual(values=blue_ornge_rep_palette, name="") + 
+  theme(strip.text.x = element_text(size=12),
+        strip.text.y = element_text(size=12),
+        plot.title = element_blank())
+
+rt.locked.plt
+
+```
+
+### Betas
+
+```{r smoothed, echo=F, fig.width=6, fig.height=3}
+rt.locked.timeseries.plt <- rt.locked.data.summary %>% 
+  mutate(time = time.since.rt) %>% 
+  dplyr::filter(time > -time.around.rt & time < time.around.rt) %>% 
+  dplyr::filter(trial_outcome %in% c("Match", "Mismatch")) %>% 
+  mutate(trial_type = paste(association_strength, trial_outcome, sep=" ")) %>% 
+  summarySEwithin(.,
+                  measurevar="pupil_diameter_z",
+                  withinvars=c("association_strength",
+                               "trial_type",
+                               "time"),
+                  idvar="subjectId") %>%
+  ggplot(aes(x = as.numeric(as.character(time)), 
+             y = pupil_diameter_z,
+             color = trial_type,
+             fill = trial_type)) +
+  geom_ribbon(aes(ymin=pupil_diameter_z-se, ymax=pupil_diameter_z+se),
+              color=NA,
+              alpha=0.3) +
+  geom_line(linewidth = 1) +
+  geom_vline(xintercept = c(0),
+             linetype = "dashed",
+             color = "gray37") +
+  labs(x = "Time since response (s)",
+       y = "Pupil diameter (z)",
+       title = "") +
+  guides(linetype = "none") + 
+  scale_color_manual(values=c("#1a75ff", "#ff751a", "#80b3ff", "#ffb380"), name="") + 
+  scale_fill_manual(values=c("#1a75ff", "#ff751a", "#80b3ff", "#ffb380"), name="") + 
+  theme(strip.text.x = element_text(size=12),
+        plot.title = element_blank())
+```
+
+```{r get_betas_rt, echo=F}
+if (compute_betas) {
+  pupil.rt.betas <- rt.locked.data %>%
+    filter(! subjectId %in% subs.exclude) %>% 
+    mutate(time = time.since.rt) %>% 
+    dplyr::filter(time > -time.around.rt & time < time.around.rt) %>% 
+    mutate_at(c('trial_outcome'), as.character) %>% 
+    mutate(is_mismatch = if_else(trial_outcome %in% c("Match"),
+                                 0,
+                                 1)) %>% 
+    mutate(is_incorrect = if_else(trial_outcome %in% c("Match", "Mismatch"),
+                                  0,
+                                  1)) %>% 
+    dplyr::filter(!is_incorrect) %>% 
+    group_by(subjectId, time) %>% 
+    group_modify(~ tidy(lm(pupil_diameter_z ~ association_strength * is_mismatch, 
+                           data = .x)))
+} 
+```
+
+```{r plot_betas_rt, echo=F, fig.width=2.6, fig.height=7, results="asis"}
+betas.rt.df <- pupil.rt.betas %>% 
+  group_by(time, term) %>% 
+  summarize(se = sd(estimate) / sqrt(sum(!is.na(estimate))),
+            estimate = mean(estimate)) %>% 
+  ungroup() %>% 
+  mutate(term = case_when(term == "association_strengthWeak (1x)" ~ "Weak v. Strong",
+                          term == "association_strengthWeak (1x):is_mismatch" ~ "Mismatch x Strength",
+                          term == "is_mismatch" ~ "Mismatch v. Match",
+                          term == "(Intercept)" ~ "Intercept",
+                          .default="")) %>% 
+  dplyr::filter(term != "") %>% 
+  mutate(across(term,
+                factor,
+                levels = c("Intercept",
+                           "Mismatch v. Match",
+                           "Weak v. Strong",
+                           "Mismatch x Strength")))
+
+results.rt.betas <- pupil.rt.betas %>% 
+  group_by(time, term) %>% 
+  summarise(t_test = list(t.test(estimate))) %>%
+  mutate(
+    t_statistic = sapply(t_test, function(x) x$statistic),
+    p_value = sapply(t_test, function(x) x$p.value),
+    conf_int_lower = sapply(t_test, function(x) x$conf.int[1]),
+    conf_int_upper = sapply(t_test, function(x) x$conf.int[2])
+  ) %>%
+  select(-t_test) %>% 
+  #mutate(p.adj = p.adjust(p_value, method = "BY")) %>% 
+  mutate(p.adj = p_value) %>% 
+  ungroup()
+
+results.rt.betas <- results.rt.betas %>%
+  dplyr::filter(p.adj < 0.05) %>% 
+  mutate(ypos = case_when(term == "association_strengthWeak (1x)" ~ -0.45,
+                          term == "association_strengthWeak (1x):is_mismatch" ~ -0.65,
+                          term == "is_mismatch" ~ -0.1,
+                          .default=0)) %>% 
+  mutate(term = case_when(term == "association_strengthWeak (1x)" ~ "Weak v. Strong",
+                          term == "association_strengthWeak (1x):is_mismatch" ~ "Mismatch x Strength",
+                          term == "is_mismatch" ~ "Mismatch v. Match",
+                          .default="")) %>% 
+  dplyr::filter(term != "") %>% 
+  mutate(across(term,
+                factor,
+                level=c("Mismatch v. Match",
+                        "Weak v. Strong",
+                        "Mismatch x Strength")))
+
+
+if (nrow(results.rt.betas) > 0) {
+  clusters <- results.rt.betas %>% 
+    group_by(term) %>% 
+    mutate(time_diff = c(NA, diff(time))) %>% 
+    mutate(time_diff_back = lead(time_diff)) %>% 
+    mutate(time_diff = round(time_diff, 2),
+           time_diff_back = round(time_diff_back, 2)) %>% 
+    dplyr::filter(time_diff > sfreq | time_diff_back > sfreq | is.na(time_diff) | is.na(time_diff_back)) %>% 
+    ungroup() %>% 
+    select(term, time, time_diff, time_diff_back) %>% 
+    arrange(term, time) %>% 
+    mutate(is_solo_point = ifelse(is.na(time_diff) & time_diff_back > sfreq, T, F)) %>% 
+    group_by(term, is_solo_point) %>% 
+    mutate(index_parity = if_else(row_number() %% 2 == 1, "start", "end")) %>% 
+    mutate(time_period = round(row_number()+1/2) / 2) %>% 
+    ungroup() %>% 
+    select(-time_diff, -time_diff_back) %>% 
+    pivot_wider(names_from=c("index_parity"),
+                values_from = "time") %>% 
+    select(-time_period, -is_solo_point) %>% 
+    mutate(cluster_size = end-start) %>% 
+    mutate(cluster_id = row_number())
+  
+  if (!"cluster.id" %in% colnames(results.rt.betas) | compute_betas) {
+    results.rt.betas <- fuzzy_left_join(
+      results.rt.betas, 
+      clusters %>% 
+        mutate(term = as.character(term)) %>% 
+        rename(cluster.term = term),
+      by = c("time" = "start", "time" = "end", "term" = "cluster.term"),
+      match_fun = list(`>=`, `<=`, `==`)
+    ) %>% 
+      dplyr::filter(!is.na(cluster_id))
+  }
+  
+  cluster_beta_means <- fuzzy_left_join(
+    pupil.rt.betas %>%
+      mutate(term = case_when(term == "association_strengthWeak (1x)" ~ "Weak v. Strong",
+                              term == "association_strengthWeak (1x):is_mismatch" ~ "Mismatch x Strength",
+                              term == "is_mismatch" ~ "Mismatch v. Match",
+                              term == "(Intercept)" ~ "Intercept",
+                              .default="")),
+    clusters %>%
+      mutate(term = as.character(term)) %>%
+      rename(cluster.term = term),
+    by = c("time" = "start", "time" = "end", "term" = "cluster.term"),
+    match_fun = list(`>=`, `<=`, `==`)
+  ) %>%
+    dplyr::filter(!is.na(cluster_id))
+  
+  clusters %>% 
+    left_join(
+      cluster_beta_means %>% 
+        group_by(subjectId, cluster_id) %>% 
+        summarize(beta = mean(estimate)) %>% 
+        group_by(cluster_id) %>% 
+        summarize(mean_beta = mean(beta),
+                  se = sd(beta) / sqrt(n()),
+                  lower_ci = mean_beta - 1.96 * se,
+                  upper_ci = mean_beta + 1.96 * se
+        ) %>% 
+        select(-se), 
+      by = "cluster_id") %>% 
+    kable(digits=2) %>% 
+    kable_styling() %>% 
+    cat()
+  
+}
+```
+
+```{r, echo=F, fig.width=5, fig.height=4}
+
+beta.no.intercept.plt <- betas.rt.df %>% 
+  dplyr::filter(term != "Intercept") %>% 
+  ggplot(aes(x=as.numeric(as.character(time)), 
+             y=estimate,
+             color=term,
+             fill=term)) + 
+  geom_ribbon(aes(ymin=estimate-se, ymax=estimate+se),
+              color=NA,
+              alpha=0.3) +
+  geom_line(linewidth = 1) +
+  geom_vline(xintercept = c(0),
+             linetype = "dashed",
+             color = "gray37") +
+  geom_hline(yintercept = c(0),
+             linetype = "longdash",
+             color = "gray37") +
+  # mark significant difference
+  geom_point(aes(x = time,
+                 y = ypos,
+                 color=term),
+             show.legend = F,
+             data = results.rt.betas,
+             size = 0.3) +
+  labs(x = "Time (s)",
+       y = paste("Pupil", greek.beta, "weights (a.u.)"),
+       title = "") +
+  guides(color="none",
+         fill="none") + 
+  facet_wrap(~term, ncol=1, scales="free_y", strip.position="top") +
+  scale_color_manual(values=beta_palette[2:4], name="") + 
+  scale_fill_manual(values=beta_palette[2:4], name="") + 
+  theme(strip.text.x = element_text(size=12),
+        plot.title = element_blank())
+
+timeseries.plt <- rt.locked.data.summary %>% 
+  mutate(time = time.since.rt) %>% 
+  dplyr::filter(time > -time.around.rt & time < time.around.rt) %>% 
+  summarySEwithin(.,
+                  measurevar="pupil_diameter_z",
+                  withinvars=c("association_strength",
+                               "trial_outcome",
+                               "time"),
+                  idvar="subjectId") %>%
+  mutate(correct = ifelse(trial_outcome %in% c("Match", "Mismatch"), 
+                          "Correct", "Incorrect")) %>% 
+  mutate(customlinetype = ifelse(trial_outcome %in% c("Match", "Mismatch"),
+                                 0,
+                                 1)) %>% 
+  mutate(across(trial_outcome,
+                factor,
+                levels = level_order)) %>% 
+  mutate(trial_type = ifelse(trial_outcome %in% c("Match", "Miss (match)"), 
+                             "Match", "Mismatch")) %>%
+  dplyr::filter(trial_outcome %in% c("Match", "Mismatch")) %>% 
+  ggplot(aes(x = as.numeric(as.character(time)), 
+             y = pupil_diameter_z,
+             color = trial_type,
+             fill = trial_type)) +
+  geom_ribbon(aes(ymin=pupil_diameter_z-se, ymax=pupil_diameter_z+se),
+              color=NA,
+              alpha=0.3) +
+  geom_line(aes(linetype = factor(customlinetype)),
+            linewidth = 1) +
+  geom_vline(xintercept = c(0),
+             linetype = "dashed",
+             color = "gray37") +
+  labs(x = "Time since response (s)",
+       y = "Pupil diameter (z)",
+       title = "") +
+  facet_wrap(~association_strength, ncol=1, strip.position="top") +
+  guides(linetype = "none") + 
+  scale_x_continuous(breaks=c(-1, 0, 1)) + 
+  scale_color_manual(values=blue_ornge_rep_palette, name="") + 
+  scale_fill_manual(values=blue_ornge_rep_palette, name="") + 
+  theme(strip.text.x = element_text(size=12),
+        strip.text.y = element_text(size=12),
+        plot.title = element_blank())
+
+timeseries.plt +
+  beta.no.intercept.plt + 
+  plot_layout(widths = c(10, 10),
+              guides = "collect") & theme(legend.position="top",
+                                          text = element_text(size=10),
+                                          strip.text.x = element_text(size=10),
+                                          legend.text=element_text(size=10))
+
+```
+
+#### Cluster correction
+
+```{r permute_rt_betas, eval=T, echo=F}
+n_permutations <- 1000
+
+run_permutation_test <- T
+
+if (run_permutation_test) {
+  permute_betas <- function(data, n_permutations) {
+    results <- replicate(n_permutations, {
+      permuted_data <- data %>%
+        mutate(estimate = estimate * sample(c(-1, 1), n(), replace = TRUE))
+    }, simplify = FALSE)
+    bind_rows(results, .id = "permutation")
+  }
+  
+  betas.permuted <- pupil.rt.betas %>%
+    group_by(subjectId, term) %>%
+    group_modify(~ permute_betas(.x, n_permutations = n_permutations)) %>%
+    ungroup() 
+  
+  tstats.permuted <- betas.permuted %>% 
+    group_by(permutation, time, term) %>% 
+    summarise(t_test = list(t.test(estimate))) %>%
+    mutate(
+      t_statistic = sapply(t_test, function(x) x$statistic),
+      p_value = sapply(t_test, function(x) x$p.value),
+      conf_int_lower = sapply(t_test, function(x) x$conf.int[1]),
+      conf_int_upper = sapply(t_test, function(x) x$conf.int[2])
+    ) %>%
+    select(-t_test) %>% 
+    mutate(p.adj = p_value) %>% 
+    ungroup() %>% 
+    dplyr::filter(p.adj < 0.05) %>% 
+    mutate(term = case_when(term == "association_strengthWeak (1x)" ~ "Weak v. Strong",
+                            term == "association_strengthWeak (1x):is_mismatch" ~ "Mismatch x Strength",
+                            term == "is_mismatch" ~ "Mismatch v. Match",
+                            .default="")) %>% 
+    dplyr::filter(term != "") %>% 
+    mutate(across(term,
+                  factor,
+                  level=c("Mismatch v. Match",
+                          "Weak v. Strong",
+                          "Mismatch x Strength")))
+  
+  tstats.permuted.rt.clusters <- tstats.permuted %>% 
+    group_by(permutation, term) %>% 
+    mutate(time_diff = c(NA, diff(time))) %>% 
+    mutate(time_diff_back = lead(time_diff)) %>% 
+    mutate(time_diff = round(time_diff, 2),
+           time_diff_back = round(time_diff_back, 2)) %>% 
+    dplyr::filter(time_diff > sfreq | time_diff_back > sfreq | is.na(time_diff) | is.na(time_diff_back)) %>% 
+    ungroup() %>% 
+    select(permutation, term, time, time_diff, time_diff_back) %>% 
+    arrange(permutation, term, time) %>% 
+    dplyr::filter(time_diff_back == sfreq | time_diff == sfreq) %>% 
+    mutate(is_solo_point = ifelse(is.na(time_diff) & time_diff_back > sfreq, T, F)) %>% 
+    group_by(permutation, term, is_solo_point) %>% 
+    mutate(index_parity = if_else(row_number() %% 2 == 1, "start", "end")) %>% 
+    mutate(time_period = round(row_number()+1/2) / 2) %>% 
+    ungroup() %>% 
+    select(-time_diff, -time_diff_back) %>% 
+    pivot_wider(names_from=c("index_parity"),
+                values_from = "time") %>% 
+    select(-time_period, -is_solo_point) %>% 
+    mutate(cluster_size = end-start) %>% 
+    dplyr::filter(!is.na(cluster_size)) %>% 
+    # check if t-values within suspected clusters have same sign (need contiguous clusters)
+    left_join(tstats.permuted %>% 
+                select(permutation, time, term, t_statistic),
+              by = c("permutation", "term"),
+              multiple = "all",
+              relationship="many-to-many") %>% 
+    dplyr::filter((time >= start) & (time <= end)) %>% 
+    mutate(t_stat_is_positive = sign(t_statistic) == 1) %>%
+    group_by(permutation, term, start, end, cluster_size) %>%
+    # checking sign of start and end points
+    summarize(n_timepoints = n(),
+              t_stat_same_sign = mean(t_stat_is_positive),
+              t_stat_same_sign = t_stat_same_sign %in% c(0, 1)) %>%
+    ungroup() %>%
+    # select clusters where t stats at the start and end are the same (otherwise not a contiguous cluster)
+    dplyr::filter(t_stat_same_sign) %>% 
+    left_join(clusters,
+              by = c("term"),
+              suffix = c(".permuted", ""),
+              multiple="all",
+              relationship="many-to-many") %>% 
+    mutate(larger_than_real_cluster = cluster_size.permuted > cluster_size) %>% 
+    group_by(permutation, term, cluster_id) %>% 
+    summarize(has_larger_cluster = max(larger_than_real_cluster)) %>% 
+    ungroup()
+}
+
+tstats.permuted.rt.clusters %>% 
+  group_by(cluster_id, term) %>% 
+  summarize(
+    n.permutations.with.clusters = n(),
+    permuted.p.value = sum(has_larger_cluster)/n_permutations) %>% 
+  kable() %>% 
+  kable_styling()
+```
+
+## Subsequent memory time series
+
+```{r submem_trial_counts, echo=F}
+
+palette <- c("#59735e", "#b7c8ba")
+
+retrieval_pupil.submem <- retrieval_pupil %>% 
+  left_join(recognition_behavior,
+            by = c("subjectId", "img", "expId"),
+            suffix = c(".retrieval", ".recognition")) %>%
+  dplyr::filter(!is.na(trial_outcome.recognition)) %>% 
+  dplyr::filter(trial_outcome.retrieval == "CR") %>% 
+  mutate(customlinetype = ifelse(trial_outcome.recognition == "Hit",
+                                 0,
+                                 1))
+```
+
+```{r submem_time_series_, echo=F, fig.width=7, fig.height=2.5}
+
+submem.exclude.subs <- c("MPE106", 
+                         "MPE111", 
+                         "MPE112", 
+                         "MPE126", 
+                         "MPE131", 
+                         "MPE134", 
+                         "MPE137", 
+                         "MPE138", 
+                         "MPE141", 
+                         "MPE144",
+                         "MPE302",
+                         "MPE510",
+                         "MPE512",
+                         "MPE514",
+                         "MPE520",
+                         "MPE527",
+                         "MPE535",
+                         "MPE529",
+                         "MPE537"
+)
+
+retrieval_pupil.submem <- retrieval_pupil.submem %>% 
+  dplyr::filter(!(subjectId %in% submem.exclude.subs))
+
+pupil_summarized.submem <- retrieval_pupil.submem %>%
+  group_by(time,
+           subjectId,
+           expId,
+           association_strength,
+           customlinetype,
+           trial_outcome.recognition) %>% 
+  summarize(pupil_diameter_z = mean(pupil_diameter_z)) %>% 
+  ungroup()
+```
+
+### Same day
+
+#### Betas
+
+```{r get_submem_betas, echo=F, results="asis"}
+compute_betas <- T
+
+if (compute_betas) {
+  pupil.imm.submem.betas <- retrieval_pupil.submem %>%
+    dplyr::filter(expId == "imm") %>% 
+    group_by(subjectId, time) %>%
+    group_modify(~ tidy(lm(pupil_diameter_z ~ association_strength * trial_outcome.recognition,
+                           data = .x)))
+}
+
+print(paste("N subjects:", 
+            length(pupil.imm.submem.betas %>% pull(subjectId) %>% unique())))
+```
+
+```{r plot_betas_submem, echo=F, fig.width=4, fig.height=7}
+betas.submem.df <- pupil.imm.submem.betas %>%
+  group_by(time, term) %>%
+  summarize(se = sd(estimate) / sqrt(sum(!is.na(estimate))),
+            estimate = mean(estimate)) %>%
+  ungroup() %>%
+  mutate(term = case_when(term == "association_strengthWeak (1x)" ~ "Memory strength (Weak v. Strong)",
+                          term == "association_strengthWeak (1x):trial_outcome.recognitionMiss" ~ "Memory outcome x Memory strength",
+                          term == "trial_outcome.recognitionMiss" ~ "Subsequent Miss v. Hit",
+                          term == "(Intercept)" ~ "Intercept",
+                          .default="")) %>%
+  dplyr::filter(term != "") %>%
+  mutate(across(term,
+                factor,
+                levels = c("Intercept",
+                           "Subsequent Miss v. Hit",
+                           "Memory strength (Weak v. Strong)",
+                           "Memory outcome x Memory strength")))
+
+results.submem.betas <- pupil.imm.submem.betas %>%
+  group_by(time, term) %>%
+  summarise(t_test = list(t.test(estimate))) %>%
+  mutate(
+    t_statistic = sapply(t_test, function(x) x$statistic),
+    p_value = sapply(t_test, function(x) x$p.value),
+    conf_int_lower = sapply(t_test, function(x) x$conf.int[1]),
+    conf_int_upper = sapply(t_test, function(x) x$conf.int[2])
+  ) %>%
+  select(-t_test) %>%
+  mutate(p.adj = p_value) %>%
+  ungroup()
+
+results.submem.betas <- results.submem.betas %>%
+  dplyr::filter(p.adj < 0.05) %>%
+  mutate(ypos = case_when(term == "association_strengthWeak (1x)" ~ -0.4,
+                          term == "association_strengthWeak (1x):trial_outcome.recognitionMiss" ~ -0.7,
+                          term == "trial_outcome.recognitionMiss" ~ -0.1,
+                          .default=0)) %>%
+  mutate(term = case_when(term == "association_strengthWeak (1x)" ~ "Memory strength (Weak v. Strong)",
+                          term == "association_strengthWeak (1x):trial_outcome.recognitionMiss" ~ "Memory outcome x Memory strength",
+                          term == "trial_outcome.recognitionMiss" ~ "Subsequent Miss v. Hit",
+                          .default="")) %>%
+  dplyr::filter(term != "") %>%
+  mutate(across(term,
+                factor,
+                level=c("Subsequent Miss v. Hit",
+                        "Memory strength (Weak v. Strong)",
+                        "Memory outcome x Memory strength")))
+
+
+clusters.submem <- results.submem.betas %>%
+  group_by(term) %>%
+  mutate(time_diff = c(NA, diff(time))) %>%
+  mutate(time_diff_back = lead(time_diff)) %>%
+  mutate(time_diff = round(time_diff, 2),
+         time_diff_back = round(time_diff_back, 2)) %>%
+  dplyr::filter(time_diff > sfreq | time_diff_back > sfreq | is.na(time_diff) | is.na(time_diff_back)) %>%
+  ungroup() %>%
+  select(term, time, time_diff, time_diff_back) %>%
+  arrange(term, time) %>%
+  mutate(is_solo_point = ifelse(is.na(time_diff) & time_diff_back > sfreq, T, F)) %>%
+  group_by(term, is_solo_point) %>%
+  mutate(index_parity = if_else(row_number() %% 2 == 1, "start", "end")) %>%
+  mutate(time_period = round(row_number()+1/2) / 2) %>%
+  ungroup() %>%
+  select(-time_diff, -time_diff_back) %>%
+  pivot_wider(names_from=c("index_parity"),
+              values_from = "time") %>%
+  select(-time_period, -is_solo_point) %>%
+  mutate(cluster_size = end-start) %>%
+  mutate(cluster_id = row_number())
+
+if (!"cluster.id" %in% colnames(results.submem.betas) | compute_betas) {
+  results.submem.betas <- fuzzy_left_join(
+    results.submem.betas, 
+    clusters.submem %>% 
+      mutate(term = as.character(term)) %>% 
+      rename(cluster.term = term),
+    by = c("time" = "start", "time" = "end", "term" = "cluster.term"),
+    match_fun = list(`>=`, `<=`, `==`)
+  ) %>% 
+    dplyr::filter(!is.na(cluster_id))
+}
+
+cluster_beta_means <- fuzzy_left_join(
+  pupil.imm.submem.betas %>% 
+    mutate(term = case_when(term == "association_strengthWeak (1x)" ~ "Memory strength (Weak v. Strong)",
+                            term == "association_strengthWeak (1x):is_mismatch" ~ "Mismatch effect x Memory strength",
+                            term == "is_mismatch" ~ "Mismatch v. Match",
+                            term == "(Intercept)" ~ "Intercept",
+                            .default="")), 
+  clusters.submem %>% 
+    mutate(term = as.character(term)) %>% 
+    rename(cluster.term = term),
+  by = c("time" = "start", "time" = "end", "term" = "cluster.term"),
+  match_fun = list(`>=`, `<=`, `==`)
+) %>% 
+  dplyr::filter(!is.na(cluster_id))
+
+clusters.submem %>% 
+  left_join(
+    cluster_beta_means %>% 
+      group_by(subjectId, cluster_id) %>% 
+      summarize(beta = mean(estimate)) %>% 
+      group_by(cluster_id) %>% 
+      summarize(mean_beta = mean(beta),
+                se = sd(beta) / sqrt(n()),
+                lower_ci = mean_beta - 1.96 * se,
+                upper_ci = mean_beta + 1.96 * se
+      ) %>% 
+      select(-se), 
+    by = "cluster_id") %>% 
+  kable(digits=2) %>% 
+  kable_styling()
+```
+
+```{r beta_submem_joint_plt, echo=F, fig.width=4, fig.height=8}
+timeseries.plt <- pupil_summarized.submem %>%
+  dplyr::filter(expId == "imm") %>% 
+  summarySEwithin(.,
+                  measurevar="pupil_diameter_z",
+                  withinvars=c("association_strength",
+                               "trial_outcome.recognition",
+                               "time"),
+                  idvar="subjectId") %>%
+  mutate(correct = ifelse(trial_outcome.recognition %in% c("Hit"),
+                          "Correct", "Incorrect")) %>%
+  mutate(customlinetype = ifelse(trial_outcome.recognition %in% c("Hit"),
+                                 0,
+                                 1)) %>%
+  ggplot(aes(x = as.numeric(as.character(time)),
+             y = pupil_diameter_z,
+             color = trial_outcome.recognition,
+             fill = trial_outcome.recognition)) +
+  geom_ribbon(aes(ymin=pupil_diameter_z-se, ymax=pupil_diameter_z+se),
+              color=NA,
+              alpha=0.3) +
+  geom_line(linewidth = 1) +
+  geom_vline(xintercept = c(0, 1, 2, 2.75),
+             linetype = "dashed",
+             color = "gray37") +
+  labs(x = "Time (s)",
+       y = "Pupil diameter (z)",
+       title = "") +
+  facet_grid(cols = vars(association_strength)) +
+  scale_color_manual(values=hit_miss_palette, name="") +
+  scale_fill_manual(values=hit_miss_palette, name="") +
+  theme(strip.text.x = element_text(size=12),
+        strip.text.y = element_text(size=12))
+
+```
+
+```{r, echo=F, fig.width=8}
+
+beta.no.intercept.plt <- betas.submem.df %>%
+  dplyr::filter(term != "Intercept") %>%
+  ggplot(aes(x=as.numeric(as.character(time)),
+             y=estimate,
+             color=term,
+             fill=term)) +
+  geom_ribbon(aes(ymin=estimate-se, ymax=estimate+se),
+              color=NA,
+              alpha=0.3) +
+  geom_line(linewidth = 1) +
+  geom_vline(xintercept = c(0, 1, 2, 2.75),
+             linetype = "dashed",
+             color = "gray37") +
+  geom_hline(yintercept = c(0),
+             linetype = "longdash",
+             color = "gray37") +
+  # mark significant difference
+  geom_point(aes(x = time,
+                 y = ypos,
+                 color=term),
+             show.legend = F,
+             data = results.submem.betas,
+             size = 0.3) +
+  labs(x = "Time (s)",
+       y = paste("Pupil", greek.beta, "weights (a.u.)"),
+       title = "") +
+  geom_text(aes(label = event,
+                x = time,
+                y = 0.5),
+            data = ret_labels,
+            inherit.aes = FALSE,
+            angle = 90,
+            hjust = 1,
+            vjust = 1.3,
+            size = 3.5,
+            colour = "gray37",
+            family = fontfamily) +
+  guides(color="none",
+         fill="none") +
+  facet_wrap(~term, ncol=1, scales="free_y", strip.position="top") +
+  scale_color_manual(values=submem.beta_palette[2:4], name="") +
+  scale_fill_manual(values=submem.beta_palette[2:4], name="") +
+  theme(strip.text.x = element_text(size=12),
+        plot.title = element_blank())
+
+timeseries.plt <- pupil_summarized.submem %>%
+  dplyr::filter(expId == "imm") %>% 
+  summarySEwithin(.,
+                  measurevar="pupil_diameter_z",
+                  withinvars=c("association_strength",
+                               "trial_outcome.recognition",
+                               "time"),
+                  idvar="subjectId") %>%
+  mutate(correct = ifelse(trial_outcome.recognition %in% c("Hit"),
+                          "Correct", "Incorrect")) %>%
+  mutate(customlinetype = ifelse(trial_outcome.recognition %in% c("Hit"),
+                                 0,
+                                 1)) %>%
+  ggplot(aes(x = as.numeric(as.character(time)),
+             y = pupil_diameter_z,
+             color = trial_outcome.recognition,
+             fill = trial_outcome.recognition)) +
+  geom_ribbon(aes(ymin=pupil_diameter_z-se, ymax=pupil_diameter_z+se),
+              color=NA,
+              alpha=0.3) +
+  geom_line(linewidth = 1) +
+  geom_vline(xintercept = c(0, 1, 2, 2.75),
+             linetype = "dashed",
+             color = "gray37") +
+  labs(x = "Time (s)",
+       y = "Pupil diameter (z)",
+       title = "") +
+  facet_wrap(~association_strength, ncol=1, strip.position="top") +
+  geom_text(aes(label = event,
+                x = time,
+                y = 0.5),
+            data = ret_labels,
+            inherit.aes = FALSE,
+            angle = 90,
+            hjust = 1,
+            vjust = 1.3,
+            size = 3.5,
+            colour = "gray37",
+            family = fontfamily) +
+  guides(linetype = "none") +
+  scale_color_manual(values=hit_miss_palette, name="") +
+  scale_fill_manual(values=hit_miss_palette, name="") +
+  theme(strip.text.x = element_text(size=12),
+        strip.text.y = element_text(size=12),
+        plot.title = element_blank())
+
+timeseries.plt +
+  beta.no.intercept.plt +
+  plot_layout(widths = c(10, 10),
+              guides = "collect") & theme(legend.position = "top")
+
+```
+
+### 2 days later
+
+#### Betas
+
+```{r get_submem_betas.del, echo=F, results="asis"}
+compute_betas <- T
+
+if (compute_betas) {
+  pupil.del.submem.betas <- retrieval_pupil.submem %>%
+    dplyr::filter(expId == "del") %>% 
+    group_by(subjectId, time) %>%
+    group_modify(~ tidy(lm(pupil_diameter_z ~ association_strength * trial_outcome.recognition,
+                           data = .x)))
+}
+
+print(paste("N subjects:", 
+            length(pupil.del.submem.betas %>% pull(subjectId) %>% unique())))
+```
+
+```{r plot_betas_submem.del, echo=F, fig.width=4, fig.height=7}
+betas.submem.df <- pupil.del.submem.betas %>%
+  group_by(time, term) %>%
+  summarize(se = sd(estimate) / sqrt(sum(!is.na(estimate))),
+            estimate = mean(estimate)) %>%
+  ungroup() %>%
+  mutate(term = case_when(term == "association_strengthWeak (1x)" ~ "Memory strength (Weak v. Strong)",
+                          term == "association_strengthWeak (1x):trial_outcome.recognitionMiss" ~ "Memory outcome x Memory strength",
+                          term == "trial_outcome.recognitionMiss" ~ "Subsequent Miss v. Hit",
+                          term == "(Intercept)" ~ "Intercept",
+                          .default="")) %>%
+  dplyr::filter(term != "") %>%
+  mutate(across(term,
+                factor,
+                levels = c("Intercept",
+                           "Subsequent Miss v. Hit",
+                           "Memory strength (Weak v. Strong)",
+                           "Memory outcome x Memory strength")))
+
+results.submem.betas <- pupil.del.submem.betas %>%
+  group_by(time, term) %>%
+  summarise(t_test = list(t.test(estimate))) %>%
+  mutate(
+    t_statistic = sapply(t_test, function(x) x$statistic),
+    p_value = sapply(t_test, function(x) x$p.value),
+    conf_int_lower = sapply(t_test, function(x) x$conf.int[1]),
+    conf_int_upper = sapply(t_test, function(x) x$conf.int[2])
+  ) %>%
+  select(-t_test) %>%
+  mutate(p.adj = p_value) %>%
+  ungroup()
+
+results.submem.betas <- results.submem.betas %>%
+  dplyr::filter(p.adj < 0.05) %>%
+  mutate(ypos = case_when(term == "association_strengthWeak (1x)" ~ -0.7,
+                          term == "association_strengthWeak (1x):trial_outcome.recognitionMiss" ~ -0.6,
+                          term == "trial_outcome.recognitionMiss" ~ -0.1,
+                          .default=0)) %>%
+  mutate(term = case_when(term == "association_strengthWeak (1x)" ~ "Memory strength (Weak v. Strong)",
+                          term == "association_strengthWeak (1x):trial_outcome.recognitionMiss" ~ "Memory outcome x Memory strength",
+                          term == "trial_outcome.recognitionMiss" ~ "Subsequent Miss v. Hit",
+                          .default="")) %>%
+  dplyr::filter(term != "") %>%
+  mutate(across(term,
+                factor,
+                level=c("Subsequent Miss v. Hit",
+                        "Memory strength (Weak v. Strong)",
+                        "Memory outcome x Memory strength")))
+
+
+clusters.submem <- results.submem.betas %>%
+  group_by(term) %>%
+  mutate(time_diff = c(NA, diff(time))) %>%
+  mutate(time_diff_back = lead(time_diff)) %>%
+  mutate(time_diff = round(time_diff, 2),
+         time_diff_back = round(time_diff_back, 2)) %>%
+  dplyr::filter(time_diff > sfreq | time_diff_back > sfreq | is.na(time_diff) | is.na(time_diff_back)) %>%
+  ungroup() %>%
+  select(term, time, time_diff, time_diff_back) %>%
+  arrange(term, time) %>%
+  mutate(is_solo_point = ifelse(is.na(time_diff) & time_diff_back > sfreq, T, F)) %>%
+  group_by(term, is_solo_point) %>%
+  mutate(index_parity = if_else(row_number() %% 2 == 1, "start", "end")) %>%
+  mutate(time_period = round(row_number()+1/2) / 2) %>%
+  ungroup() %>%
+  select(-time_diff, -time_diff_back) %>%
+  pivot_wider(names_from=c("index_parity"),
+              values_from = "time") %>%
+  select(-time_period, -is_solo_point) %>%
+  mutate(cluster_size = end-start) %>%
+  mutate(cluster_id = row_number())
+
+if (!"cluster.id" %in% colnames(results.submem.betas) | compute_betas) {
+  results.submem.betas <- fuzzy_left_join(
+    results.submem.betas, 
+    clusters.submem %>% 
+      mutate(term = as.character(term)) %>% 
+      rename(cluster.term = term),
+    by = c("time" = "start", "time" = "end", "term" = "cluster.term"),
+    match_fun = list(`>=`, `<=`, `==`)
+  ) %>% 
+    dplyr::filter(!is.na(cluster_id))
+}
+
+cluster_beta_means <- fuzzy_left_join(
+  pupil.del.submem.betas %>% 
+    mutate(term = case_when(term == "association_strengthWeak (1x)" ~ "Memory strength (Weak v. Strong)",
+                            term == "association_strengthWeak (1x):is_mismatch" ~ "Mismatch effect x Memory strength",
+                            term == "is_mismatch" ~ "Mismatch v. Match",
+                            term == "(Intercept)" ~ "Intercept",
+                            .default="")), 
+  clusters.submem %>% 
+    mutate(term = as.character(term)) %>% 
+    rename(cluster.term = term),
+  by = c("time" = "start", "time" = "end", "term" = "cluster.term"),
+  match_fun = list(`>=`, `<=`, `==`)
+) %>% 
+  dplyr::filter(!is.na(cluster_id))
+
+clusters.submem %>% 
+  left_join(
+    cluster_beta_means %>% 
+      group_by(subjectId, cluster_id) %>% 
+      summarize(beta = mean(estimate)) %>% 
+      group_by(cluster_id) %>% 
+      summarize(mean_beta = mean(beta),
+                se = sd(beta) / sqrt(n()),
+                lower_ci = mean_beta - 1.96 * se,
+                upper_ci = mean_beta + 1.96 * se
+      ) %>% 
+      select(-se), 
+    by = "cluster_id") %>% 
+  kable(digits=2) %>% 
+  kable_styling()
+```
+
+```{r beta_submem_joint_plt.del, echo=F, fig.width=4, fig.height=8}
+timeseries.plt <- pupil_summarized.submem %>%
+  dplyr::filter(expId == "del") %>% 
+  summarySEwithin(.,
+                  measurevar="pupil_diameter_z",
+                  withinvars=c("association_strength",
+                               "trial_outcome.recognition",
+                               "time"),
+                  idvar="subjectId") %>%
+  mutate(correct = ifelse(trial_outcome.recognition %in% c("Hit"),
+                          "Correct", "Incorrect")) %>%
+  mutate(customlinetype = ifelse(trial_outcome.recognition %in% c("Hit"),
+                                 0,
+                                 1)) %>%
+  ggplot(aes(x = as.numeric(as.character(time)),
+             y = pupil_diameter_z,
+             color = trial_outcome.recognition,
+             fill = trial_outcome.recognition)) +
+  geom_ribbon(aes(ymin=pupil_diameter_z-se, ymax=pupil_diameter_z+se),
+              color=NA,
+              alpha=0.3) +
+  geom_line(linewidth = 1) +
+  geom_vline(xintercept = c(0, 1, 2, 2.75),
+             linetype = "dashed",
+             color = "gray37") +
+  labs(x = "Time (s)",
+       y = "Pupil diameter (z)",
+       title = "") +
+  facet_grid(cols = vars(association_strength)) +
+  scale_color_manual(values=hit_miss_palette, name="") +
+  scale_fill_manual(values=hit_miss_palette, name="") +
+  theme(strip.text.x = element_text(size=12),
+        strip.text.y = element_text(size=12))
+
+```
+
+```{r, echo=F, fig.width=8}
+
+beta.no.intercept.plt <- betas.submem.df %>%
+  dplyr::filter(term != "Intercept") %>%
+  ggplot(aes(x=as.numeric(as.character(time)),
+             y=estimate,
+             color=term,
+             fill=term)) +
+  geom_ribbon(aes(ymin=estimate-se, ymax=estimate+se),
+              color=NA,
+              alpha=0.3) +
+  geom_line(linewidth = 1) +
+  geom_vline(xintercept = c(0, 1, 2, 2.75),
+             linetype = "dashed",
+             color = "gray37") +
+  geom_hline(yintercept = c(0),
+             linetype = "longdash",
+             color = "gray37") +
+  # mark significant difference
+  geom_point(aes(x = time,
+                 y = ypos,
+                 color=term),
+             show.legend = F,
+             data = results.submem.betas,
+             size = 0.3) +
+  labs(x = "Time (s)",
+       y = paste("Pupil", greek.beta, "weights (a.u.)"),
+       title = "") +
+  geom_text(aes(label = event,
+                x = time,
+                y = 0.5),
+            data = ret_labels,
+            inherit.aes = FALSE,
+            angle = 90,
+            hjust = 1,
+            vjust = 1.3,
+            size = 3.5,
+            colour = "gray37",
+            family = fontfamily) +
+  guides(color="none",
+         fill="none") +
+  facet_wrap(~term, ncol=1, scales="free_y", strip.position="top") +
+  scale_color_manual(values=submem.beta_palette[2:4], name="") +
+  scale_fill_manual(values=submem.beta_palette[2:4], name="") +
+  theme(strip.text.x = element_text(size=12),
+        plot.title = element_blank())
+
+timeseries.plt <- pupil_summarized.submem %>%
+  dplyr::filter(expId == "del") %>% 
+  summarySEwithin(.,
+                  measurevar="pupil_diameter_z",
+                  withinvars=c("association_strength",
+                               "trial_outcome.recognition",
+                               "time"),
+                  idvar="subjectId") %>%
+  mutate(correct = ifelse(trial_outcome.recognition %in% c("Hit"),
+                          "Correct", "Incorrect")) %>%
+  mutate(customlinetype = ifelse(trial_outcome.recognition %in% c("Hit"),
+                                 0,
+                                 1)) %>%
+  ggplot(aes(x = as.numeric(as.character(time)),
+             y = pupil_diameter_z,
+             color = trial_outcome.recognition,
+             fill = trial_outcome.recognition)) +
+  geom_ribbon(aes(ymin=pupil_diameter_z-se, ymax=pupil_diameter_z+se),
+              color=NA,
+              alpha=0.3) +
+  geom_line(linewidth = 1) +
+  geom_vline(xintercept = c(0, 1, 2, 2.75),
+             linetype = "dashed",
+             color = "gray37") +
+  labs(x = "Time (s)",
+       y = "Pupil diameter (z)",
+       title = "") +
+  facet_wrap(~association_strength, ncol=1, strip.position="top") +
+  geom_text(aes(label = event,
+                x = time,
+                y = 0.5),
+            data = ret_labels,
+            inherit.aes = FALSE,
+            angle = 90,
+            hjust = 1,
+            vjust = 1.3,
+            size = 3.5,
+            colour = "gray37",
+            family = fontfamily) +
+  guides(linetype = "none") +
+  scale_color_manual(values=hit_miss_palette, name="") +
+  scale_fill_manual(values=hit_miss_palette, name="") +
+  theme(strip.text.x = element_text(size=12),
+        strip.text.y = element_text(size=12),
+        plot.title = element_blank())
+
+timeseries.plt +
+  beta.no.intercept.plt +
+  plot_layout(widths = c(10, 10),
+              guides = "collect") & theme(legend.position = "top")
+
+```
+
+## Main beta clusters and subsequent memory
+
+```{r pupil_clusters_submem, echo=F}
+
+stim.locked.clusters %>%
+  kable() %>%
+  kable_styling()
+
+pupil.cluster.data <- stim.locked.clusters %>%
+  cross_join(retrieval_pupil) %>%
+  dplyr::filter(time >= start & time <= end) %>%
+  group_by(subjectId,
+           expId,
+           trialN,
+           trial_outcome,
+           association_strength,
+           term,
+           img,
+           cluster_id,
+           start,
+           end) %>%
+  summarize(pupil_diameter_z = mean(pupil_diameter_z)) %>%
+  ungroup()
+
+pupil.cluster.submem <- pupil.cluster.data %>%
+  left_join(recognition_behavior,
+            by = c("subjectId", "img", "expId"),
+            suffix = c(".retrieval", ".recognition")) %>%
+  dplyr::filter(!is.na(trial_outcome.recognition)) %>%
+  dplyr::filter(trial_outcome.retrieval == "CR") %>%
+  dplyr::filter(!(subjectId %in% submem.exclude.subs))
+
+```
+
+### Miss v. Hit
+
+```{r plot_submem, echo=F, fig.height=8, fig.width=5}
+pupil.cluster.submem %>% 
+  group_by(subjectId, 
+           association_strength, 
+           trial_outcome.recognition, 
+           cluster_id,
+           expId) %>% 
+  summarize(pupil_diameter_z = mean(pupil_diameter_z)) %>% 
+  summarySEwithin(., 
+                  measurevar="pupil_diameter_z", 
+                  withinvars=c("association_strength",
+                               "trial_outcome.recognition",
+                               "cluster_id"),
+                  betweenvars=c("expId"),
+                  idvar="subjectId") %>% 
+  mutate(expId = case_when(as.character(expId) == "imm" ~ "Experiment 1",
+                           as.character(expId) == "del" ~ "Experiment 2")) %>%
+  mutate(across(expId,
+                factor,
+                levels = c("Experiment 1", 
+                           "Experiment 2"))) %>% 
+  ggplot(aes(x = association_strength,
+             y = pupil_diameter_z,
+             fill = trial_outcome.recognition)) +
+  stat_summary(fun = "mean", 
+               geom = "bar", 
+               color = "black", 
+               position=position_dodge()) +
+  geom_errorbar(aes(ymin=pupil_diameter_z-se, ymax=pupil_diameter_z+se),
+                position=position_dodge(.9), 
+                width=.2) +
+  scale_color_manual(values=hit_miss_palette, name="") +
+  scale_fill_manual(values=hit_miss_palette, name="") +
+  labs(x = "", y = y_axis_pupil_label) +
+  facet_grid(rows = vars(cluster_id),
+             cols = vars(expId))
+```
+
+### Hit RT
+
+```{r submem.rt, echo=F, fig.height=8, fig.width=5}
+
+nbins <- 4
+
+pupil.cluster.submem %>% 
+  dplyr::filter(trial_outcome.recognition == "Hit") %>% 
+  group_by(subjectId, trial_outcome.recognition, association_strength, cluster_id, expId) %>%
+  mutate(trial_count = n()) %>%
+  ungroup() %>%
+  dplyr::filter(trial_count > nbins-1) %>%
+  group_by(subjectId, trial_outcome.recognition, association_strength, cluster_id, expId) %>% 
+  mutate(pupil_bin = cut_interval(pupil_diameter_z, 
+                                  n = nbins,
+                                  labels = F)) %>% 
+  ungroup() %>% 
+  group_by(subjectId, trial_outcome.recognition, association_strength,
+           cluster_id, pupil_bin, expId) %>% 
+  summarize(rt = median(recognition_response.rt)) %>% 
+  summarySEwithin(., 
+                  measurevar="rt", 
+                  withinvars=c("association_strength",
+                               "trial_outcome.recognition",
+                               "cluster_id",
+                               "pupil_bin"),
+                  betweenvars=c("expId"),
+                  idvar="subjectId") %>% 
+  mutate(expId = case_when(as.character(expId) == "imm" ~ "Experiment 1",
+                           as.character(expId) == "del" ~ "Experiment 2")) %>%
+  mutate(across(expId,
+                factor,
+                levels = c("Experiment 1", 
+                           "Experiment 2"))) %>% 
+  ggplot(aes(x = as.numeric(as.character(pupil_bin)),
+             y = rt,
+             color = association_strength,
+             group = association_strength)) +
+  geom_line(linewidth=0.8) +
+  geom_point(size=1.5) +
+  geom_errorbar(aes(ymin=rt-se, ymax=rt+se),
+                width=0.2) +
+  scale_color_manual(values=palette, name="") +
+  scale_fill_manual(values=palette, name="") +
+  labs(x = "Pupil quartile", y = "RT (s)") +
+  facet_grid(rows=vars(cluster_id), 
+             cols = vars(expId))
+
+```
+
+### Models
+
+```{r submem_models, echo=F, results="asis", eval=run_models}
+
+submem.cluster.mods <- list()
+submem.rt.mods <- list()
+
+for (this.cluster in pupil.cluster.submem %>% pull(cluster_id) %>% unique()) {
+  mod.data <- pupil.cluster.submem %>% 
+    dplyr::filter(cluster_id == this.cluster)
+  
+  mod <- mod.data %>% 
+    lmer(pupil_diameter_z ~ trial_outcome.recognition * association_strength * expId + 
+           (trial_outcome.recognition * association_strength | subjectId) +
+           (1 | expId),
+         data = .)
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>% 
+      lmer(pupil_diameter_z ~ trial_outcome.recognition * association_strength * expId + 
+             (trial_outcome.recognition * association_strength | subjectId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>% 
+      lmer(pupil_diameter_z ~ trial_outcome.recognition * association_strength * expId + 
+             (trial_outcome.recognition + association_strength | subjectId) + 
+             (1 | expId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>% 
+      lmer(pupil_diameter_z ~ trial_outcome.recognition * association_strength * expId + 
+             (trial_outcome.recognition + association_strength | subjectId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>% 
+      lmer(pupil_diameter_z ~ trial_outcome.recognition * association_strength * expId + 
+             (trial_outcome.recognition | subjectId) + 
+             (1 | expId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>% 
+      lmer(pupil_diameter_z ~ trial_outcome.recognition * association_strength * expId + 
+             (trial_outcome.recognition | subjectId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>% 
+      lmer(pupil_diameter_z ~ trial_outcome.recognition * association_strength * expId + 
+             (1 | subjectId) + 
+             (1 | expId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>% 
+      lmer(pupil_diameter_z ~ trial_outcome.recognition * association_strength * expId + 
+             (1 | subjectId),
+           data = .)
+  }
+  
+  submem.cluster.mods[[this.cluster]] <- mod
+  
+  ### 
+  
+  mod.data <- pupil.cluster.submem %>% 
+    dplyr::filter(trial_outcome.recognition == "Hit") %>% 
+    dplyr::filter(cluster_id == this.cluster)
+  
+  mod <- mod.data %>% 
+    lmer(recognition_response.rt ~ pupil_diameter_z * association_strength + 
+           (pupil_diameter_z * association_strength | subjectId) + 
+           (1 | expId),
+         data = .)
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>% 
+      lmer(recognition_response.rt ~ pupil_diameter_z * association_strength + 
+             (pupil_diameter_z * association_strength | subjectId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>% 
+      lmer(recognition_response.rt ~ pupil_diameter_z * association_strength + 
+             (pupil_diameter_z + association_strength | subjectId) + 
+             (1 | expId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>% 
+      lmer(recognition_response.rt ~ pupil_diameter_z * association_strength + 
+             (pupil_diameter_z + association_strength | subjectId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>% 
+      lmer(recognition_response.rt ~ pupil_diameter_z * association_strength + 
+             (pupil_diameter_z | subjectId) + 
+             (1 | expId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>% 
+      lmer(recognition_response.rt ~ pupil_diameter_z * association_strength + 
+             (pupil_diameter_z | subjectId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>% 
+      lmer(recognition_response.rt ~ pupil_diameter_z * association_strength + 
+             (1 | subjectId) + 
+             (1 | expId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>% 
+      lmer(recognition_response.rt ~ pupil_diameter_z * association_strength + 
+             (1 | subjectId),
+           data = .)
+  }
+  
+  submem.rt.mods[[this.cluster]] <- mod
+}
+```
+
+### Joint plots
+
+```{r show_submem_models, echo=F, results="asis", fig.height=3, fig.width=10}
+
+for (this.cluster in pupil.cluster.submem %>% pull(cluster_id) %>% unique()) {
+  mod <- submem.cluster.mods[[this.cluster]]
+  
+  mod.data <- pupil.cluster.submem %>% 
+    dplyr::filter(cluster_id == this.cluster)
+  
+  cluster.plt <- mod.data %>% 
+    group_by(subjectId, 
+             association_strength, 
+             trial_outcome.recognition,
+             expId) %>% 
+    summarize(pupil_diameter_z = mean(pupil_diameter_z)) %>% 
+    summarySEwithin(., 
+                    measurevar="pupil_diameter_z", 
+                    withinvars=c("association_strength",
+                                 "trial_outcome.recognition"),
+                    betweenvars=c("expId"),
+                    idvar="subjectId") %>% 
+    mutate(expId = case_when(as.character(expId) == "imm" ~ "Experiment 1",
+                             as.character(expId) == "del" ~ "Experiment 2")) %>%
+    mutate(across(expId,
+                  factor,
+                  levels = c("Experiment 1", 
+                             "Experiment 2"))) %>% 
+    ggplot(aes(x = association_strength,
+               y = pupil_diameter_z,
+               fill = trial_outcome.recognition)) +
+    stat_summary(fun = "mean", 
+                 geom = "bar", 
+                 color = "black", 
+                 position=position_dodge()) +
+    geom_errorbar(aes(ymin=pupil_diameter_z-se, ymax=pupil_diameter_z+se),
+                  position=position_dodge(.9), 
+                  width=.2) +
+    scale_color_manual(values=hit_miss_palette, name="") +
+    scale_fill_manual(values=hit_miss_palette, name="") +
+    labs(x = "", y = y_axis_pupil_label,
+         title = "") +
+    facet_grid(cols = vars(expId)) +
+    theme(strip.text.x = element_text(size=12))
+  
+  print(cluster.plt)
+  
+  tidy(mod, effects = "fixed", conf.int = T, conf.level = 0.95) %>% 
+    select(term, estimate, conf.low, conf.high, p.value, std.error, df) %>%
+    kable(caption=paste(this.cluster, ": ", formula(mod)[3], sep=""),
+          digits=3) %>% 
+    kable_styling() %>%
+    cat()
+  
+  emm <- emmeans(mod, ~ trial_outcome.recognition | association_strength | expId, adjust="bonferroni")
+  emm.pairs <- pairs(emm)
+  tidy(emm.pairs, effects = "fixed", conf.int = T, conf.level = 0.95) %>% 
+    select(expId, association_strength, contrast, estimate, conf.low, conf.high, p.value, std.error) %>% 
+    kable(digits=3) %>% 
+    kable_styling() %>% 
+    cat()
+  
+  ###
+  
+  tidy(mod, effects = "fixed", conf.int = T, conf.level = 0.95, exponentiate=T) %>%
+    select(term, estimate, conf.low, conf.high, p.value, std.error) %>%
+    kable(caption=paste(this.cluster, ": pupil ~ ", formula(mod)[3], sep=""),
+          digits=3) %>% 
+    kable_styling() %>%
+    cat()
+  
+  mod.data <- pupil.cluster.submem %>% 
+    dplyr::filter(trial_outcome.recognition == "Hit") %>% 
+    dplyr::filter(cluster_id == this.cluster)
+  
+  mod <- submem.rt.mods[[this.cluster]]
+  
+  rt.plt <- mod.data %>% 
+    group_by(subjectId, 
+             trial_outcome.recognition, 
+             association_strength, 
+             cluster_id, 
+             expId) %>%
+    mutate(trial_count = n()) %>%
+    ungroup() %>%
+    dplyr::filter(trial_count > nbins-1) %>%
+    group_by(subjectId, trial_outcome.recognition, association_strength, expId) %>% 
+    mutate(pupil_bin = cut_interval(pupil_diameter_z, 
+                                    n = nbins,
+                                    labels = F)) %>% 
+    ungroup() %>% 
+    group_by(subjectId, trial_outcome.recognition, association_strength,
+             pupil_bin, expId) %>% 
+    summarize(rt = median(recognition_response.rt)) %>% 
+    mutate(expId = case_when(as.character(expId) == "imm" ~ "Experiment 1",
+                             as.character(expId) == "del" ~ "Experiment 2")) %>%
+    mutate(across(expId,
+                  factor,
+                  levels = c("Experiment 1", 
+                             "Experiment 2"))) %>% 
+    summarySEwithin(., 
+                    measurevar="rt", 
+                    withinvars=c("association_strength",
+                                 "trial_outcome.recognition",
+                                 "pupil_bin"), 
+                    betweenvars=c("expId"),
+                    idvar="subjectId") %>% 
+    ggplot(aes(x = as.numeric(as.character(pupil_bin)),
+               y = rt,
+               color = association_strength,
+               group = association_strength)) +
+    geom_line(linewidth=0.8) +
+    geom_point(size=1.5) +
+    geom_errorbar(aes(ymin=rt-se, ymax=rt+se),
+                  width=0.2) +
+    scale_color_manual(values=palette, name="") +
+    scale_fill_manual(values=palette, name="") +
+    labs(x = "Pupil quartile", 
+         y = "RT (s)",
+         title = "") +
+    facet_grid(cols = vars(expId)) +
+    theme(strip.text.x = element_text(size=12))
+  
+  print(rt.plt)
+  
+  tidy(mod, effects = "fixed", conf.int = T, conf.level = 0.95) %>% 
+    select(term, estimate, conf.low, conf.high, p.value, std.error, df) %>% 
+    kable(caption=paste(this.cluster, ": RT ~ ", formula(mod)[3], sep=""),
+          digits=3) %>% 
+    kable_styling() %>%
+    cat()
+  
+  joint.plt <- (cluster.plt + rt.plt) +
+    plot_layout(widths=c(1.4,1), 
+                guides="collect", axes = "collect", axis_titles = "collect")
+  
+  print(joint.plt)
+  
+  showtext_opts(dpi = 300)
+  ggsave(paste("submem_figures/submem_all_models_cluster-", 
+               this.cluster, 
+               "_hit_miss_rt.png", 
+               sep=""),
+         plot=joint.plt,
+         width=26,
+         height=8,
+         dpi=300,
+         create.dir=T,
+         units="cm")
+  showtext_opts(op)
+  
+}
+```
+
+
+# Save
+
+```{r save_data, echo=T}
+save(pupil.betas, results.betas,
+     pupil.rt.betas, results.rt.betas,
+     tstats.permuted.clusters,
+     tstats.permuted.rt.clusters,
+     submem.cluster.mods,
+     submem.rt.mods,
+     subj.cluster_beta_means,
+     pupil.imm.submem.betas,
+     pupil.del.submem.betas,
+     file="pupil_betas.RData")
+```

@@ -1,0 +1,1917 @@
+---
+title: "Power"
+author: "Alice Xue"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+params:
+    power_name: "posterior-alpha"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 3
+    toc_float:
+      collapsed: no
+    self_contained: true
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+---
+
+```{r setup, include=FALSE}
+library(plyr)
+library(tidymv)
+library(Hmisc)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+library(data.table)
+library(psycho)
+library(lme4)
+library(sjPlot)
+library(afex)
+library(wesanderson)
+library(viridis)
+library(showtext)
+library(tidyverse)
+library(mgcv)
+library(itsadug)
+library(RColorBrewer)
+library(ggcorrplot)
+library(devtools)
+library(factoextra)
+library(tidyjson)
+library(purrr)
+library(broom)
+library(zoo)
+library(psych)
+library(patchwork)
+library(emmeans)
+library(ggpubr)
+library(stats)
+library(broom.mixed)
+library(pracma)
+library(afex)
+library(gsignal)
+library(fuzzyjoin)
+
+font_add(family = "Avenir Next",
+         regular = "../utils/AvenirNext-Regular.ttf",
+         bold = "../utils/AvenirNext-DemiBold.ttf",
+         italic = "../utils/AvenirNext-Italic.ttf")
+showtext.auto()
+
+fontfamily <- "Avenir Next"
+
+set_theme(
+  base=theme_classic(base_size = 12,
+                     base_family="Avenir Next",
+                     base_line_size = 12/30,
+                     base_rect_size = 12/30)
+)
+
+options(dplyr.summarise.inform = FALSE)
+
+knitr::opts_chunk$set(echo = TRUE, 
+                      warning=FALSE, 
+                      message = FALSE, 
+                      fig.showtext=TRUE)
+
+# knitr::opts_chunk$set(dev = 'pdf') # set output device to pdf
+
+source("../utils/summary_se_utils.R")
+```
+
+```{r get_behavior, echo=F}
+set.seed(478)
+
+power_name <- params$power_name
+
+stopifnot(power_name %in% c("frontal-theta", "posterior-alpha"))
+
+if (power_name == "frontal-theta") {
+  hits <- fread("../../data/eeg/MPE_frontal_theta_asso_retrieval_Hit.csv")
+  crs <- fread("../../data/eeg/MPE_frontal_theta_asso_retrieval_CR.csv")
+  misses <- fread("../../data/eeg/MPE_frontal_theta_asso_retrieval_Miss.csv")
+  fas <- fread("../../data/eeg/MPE_frontal_theta_asso_retrieval_FA.csv")
+  y_axis_power_label = "Frontal theta"
+} else if (power_name == "posterior-alpha") {
+  hits <- fread("../../data/eeg/MPE_posterior_alpha_asso_retrieval_Hit.csv")
+  crs <- fread("../../data/eeg/MPE_posterior_alpha_asso_retrieval_CR.csv")
+  misses <- fread("../../data/eeg/MPE_posterior_alpha_asso_retrieval_Miss.csv")
+  fas <- fread("../../data/eeg/MPE_posterior_alpha_asso_retrieval_FA.csv")
+  y_axis_power_label = "Posterior alpha"
+}
+
+power <- bind_rows(list(hits, crs, misses, fas))
+
+greek.beta <- "\u03B2"
+```
+
+```{r labels, echo=F}
+palette <- c("#008080", "#9fdfbf")
+beta_palette <- c("#9E0059", "#1A936F", "#FFD131")
+
+beta_palette <- c("#A7A2A9", 
+                  "#F6511D", 
+                  "#FFB400", 
+                  "#00A6ED", 
+                  "#7CB518", 
+                  "#0EAD69", 
+                  "#4F518C", 
+                  "#B24C63")
+
+sfreq <- 0.008
+
+ret_labels_strong <- tibble(event = c("cue", "delay", "probe", "ITI"),
+                            time = c(0, 1, 2, 2.75))
+
+ret_labels_weak <- tibble(event = c("cue", "delay", "probe", "ITI"),
+                          time = c(0, 1, 2, 2.75))
+
+ret_labels <- rbind(ret_labels_strong, ret_labels_weak)
+
+if (power_name == "frontal-theta") {
+  ret_labels$position <- 1
+} else if (power_name == "posterior-alpha") {
+  ret_labels$position <- 0.5
+}
+
+
+if (power_name == "frontal-theta") {
+  ymin.power <- -0.5
+  ymax.power <- 1.5
+} else if (power_name == "posterior-alpha") {
+  ymin.power <- -0.6
+  ymax.power <- 0.5
+}
+
+```
+
+# Power time series
+
+```{r mean_time_series, echo=F}
+power.summarized <- power %>%
+  mutate(hit = is_match_trial & (match_response.keys==1)) %>%
+  mutate(false_alarm = !is_match_trial & (match_response.keys==1)) %>%
+  mutate(miss = is_match_trial & (match_response.keys==2)) %>%
+  mutate(correct_rejection = !is_match_trial & (match_response.keys==2)) %>%
+  mutate(customlinetype = ifelse(hit | correct_rejection,
+                                 0,
+                                 1)) %>% 
+  mutate(trial_outcome = case_when(hit ~ "Match",
+                                   false_alarm ~ "False alarm",
+                                   miss ~ "Miss",
+                                   correct_rejection ~ "Mismatch")) %>%
+  dplyr::filter(!is.na(match_response.rt)) %>%  
+  dplyr::filter(trial_outcome %in% c("Match", "False alarm", "Miss", "Mismatch")) %>% 
+  group_by(time,
+           subjectId,
+           association_strength,
+           customlinetype,
+           trial_outcome) %>% 
+  summarize(power = mean(power)) %>% 
+  ungroup() 
+
+results.plt1 <- power.summarized %>% 
+  select(-customlinetype) %>% 
+  pivot_wider(names_from = c("association_strength", "trial_outcome"), 
+              values_from = "power") %>% 
+  group_by(time) %>% 
+  nest() %>%
+  mutate(
+    test_results = map(data, ~ {
+      column_pairs <- list(
+        c("Strong (4x)_Match", "Weak (1x)_Match"),
+        c("Strong (4x)_Mismatch", "Weak (1x)_Mismatch"),
+        c("Strong (4x)_Miss", "Weak (1x)_Miss"),
+        c("Strong (4x)_False alarm", "Weak (1x)_False alarm")
+      )
+      # Perform the Wilcoxon signed-rank test for each column pair
+      map_dfr(column_pairs, function(cols) {
+        before_col <- cols[1]
+        after_col <- cols[2]
+        
+        # Check if columns exist in the dataframe
+        if (before_col %in% names(.x) & after_col %in% names(.x)) {
+          test <- wilcox.test(.x[[before_col]], .x[[after_col]], paired = TRUE)
+          tibble(
+            before_col = before_col,
+            after_col = after_col,
+            p_value = test$p.value,
+            test_statistic = test$statistic
+          )
+        } else {
+          tibble(
+            before_col = before_col,
+            after_col = after_col,
+            p_value = NA_real_,
+            test_statistic = NA_real_
+          )
+        }
+      })
+    })
+  ) %>%
+  unnest(cols = c(test_results)) %>% 
+  select(-data) %>% 
+  separate(before_col, into = c("association_strength_col1", "trial_outcome_col1"), sep = "_") %>% 
+  separate(after_col, into = c("association_strength_col2", "trial_outcome_col2"), sep = "_") %>% 
+  mutate(p.adj = p.adjust(p_value, method = "BY"))
+
+level_order <- c("Match",  "Mismatch", "Miss", "False alarm")
+
+results.plt1 <- results.plt1 %>%
+  dplyr::filter(p.adj < 0.05) %>%
+  dplyr::filter(trial_outcome_col1 == trial_outcome_col2) %>%
+  mutate(trial_outcome = trial_outcome_col1,
+         association_strength = "p < 0.05") %>%
+  select(-trial_outcome_col1, -trial_outcome_col2)
+
+
+results.plt1 %>% 
+  group_by(trial_outcome) %>% 
+  mutate(time_diff = c(NA, diff(time))) %>% 
+  mutate(time_diff_back = lead(time_diff)) %>% 
+  mutate(time_diff = round(time_diff, 3),
+         time_diff_back = round(time_diff_back, 3)) %>% 
+  dplyr::filter(time_diff > sfreq | time_diff_back > sfreq | is.na(time_diff) | is.na(time_diff_back)) %>% 
+  ungroup() %>% 
+  select(trial_outcome, time, time_diff, time_diff_back) %>% 
+  mutate(across(trial_outcome,
+                factor,
+                level=level_order)) %>% 
+  arrange(trial_outcome, time) %>% 
+  mutate(is_solo_point = ifelse((is.na(time_diff) & time_diff_back > sfreq) |
+                                  (time_diff > sfreq & time_diff_back > sfreq), T, F)) %>% 
+  group_by(trial_outcome, is_solo_point) %>% 
+  mutate(index_parity = if_else(row_number() %% 2 == 1, "start", "end")) %>% 
+  mutate(index_parity = if_else(is_solo_point, "start", index_parity)) %>% 
+  mutate(time_period = round(row_number()+1/2) / 2) %>% 
+  ungroup() %>% 
+  select(-time_diff, -time_diff_back) %>% 
+  pivot_wider(names_from=c("index_parity"),
+              values_from = "time", values_fn=list) %>% 
+  select(-time_period, -is_solo_point) %>% 
+  kable() %>% 
+  kable_styling()
+
+power.summarized %>% 
+  summarySEwithin(.,
+                  measurevar="power",
+                  withinvars=c("association_strength",
+                               "trial_outcome",
+                               "customlinetype",
+                               "time"),
+                  idvar="subjectId") %>%
+  ggplot(aes(x = as.numeric(as.character(time)), 
+             y = power,
+             color = association_strength,
+             fill = association_strength)) +
+  geom_ribbon(aes(ymin=power-se, ymax=power+se),
+              color=NA,
+              alpha=0.3) +
+  geom_line(aes(linetype = factor(customlinetype)),
+            linewidth = 1) +
+  # # mark significant difference
+  # geom_point(aes(x = time,
+  #                y = ymin.power),
+  #            color = "gray37",
+  #            fill = "gray37",
+  #            show.legend = F,
+  #            data = results.plt1,
+  #            size = 0.5) +
+  geom_vline(xintercept = c(0, 1, 2, 2.75),
+             linetype = "dashed",
+             color = "gray37") +
+  labs(x = "Time (s)",
+       y = paste(y_axis_power_label, "power", sep=" "),
+       title = "") +
+  facet_wrap(~factor(trial_outcome, level = level_order), nrow=2) +
+  geom_text(aes(label = event,
+                x = time,
+                y = position),
+            data = ret_labels,
+            inherit.aes = FALSE,
+            angle = 90,
+            hjust = 1,
+            vjust = 1.3,
+            size = 3.5,
+            colour = "gray37",
+            family = fontfamily) +
+  guides(linetype = "none") + 
+  scale_color_manual(values=palette, name="") + 
+  scale_fill_manual(values=palette, name="") + 
+  theme(strip.text.x = element_text(size=12))
+
+####
+results.plt2 <- power.summarized %>% 
+  select(-customlinetype) %>% 
+  pivot_wider(names_from = c("association_strength", "trial_outcome"), 
+              values_from = "power") %>% 
+  group_by(time) %>% 
+  nest() %>%
+  mutate(
+    test_results = map(data, ~ {
+      column_pairs <- list(
+        c("Strong (4x)_Match", "Strong (4x)_Mismatch"),
+        c("Weak (1x)_Match", "Weak (1x)_Mismatch"),
+        c("Strong (4x)_False alarm", "Strong (4x)_Miss"),
+        c("Weak (1x)_False alarm", "Weak (1x)_Miss")
+      )
+      
+      # Perform the Wilcoxon signed-rank test for each column pair
+      map_dfr(column_pairs, function(cols) {
+        before_col <- cols[1]
+        after_col <- cols[2]
+        
+        # Check if columns exist in the dataframe
+        if (before_col %in% names(.x) & after_col %in% names(.x)) {
+          test <- wilcox.test(.x[[before_col]], .x[[after_col]], paired = TRUE)
+          tibble(
+            before_col = before_col,
+            after_col = after_col,
+            p_value = test$p.value,
+            test_statistic = test$statistic
+          )
+        } else {
+          tibble(
+            before_col = before_col,
+            after_col = after_col,
+            p_value = NA_real_,
+            test_statistic = NA_real_
+          )
+        }
+      })
+    })
+  ) %>%
+  unnest(cols = c(test_results)) %>% 
+  select(-data) %>% 
+  separate(before_col, into = c("association_strength_col1", "trial_outcome_col1"), sep = "_") %>% 
+  separate(after_col, into = c("association_strength_col2", "trial_outcome_col2"), sep = "_") %>% 
+  mutate(p.adj = p.adjust(p_value, method = "BY"))
+
+
+results.plt2 <- results.plt2 %>%
+  dplyr::filter(p.adj < 0.05) %>%
+  dplyr::filter(association_strength_col1 == association_strength_col2) %>%
+  mutate(association_strength = association_strength_col1,
+         trial_type = "p < 0.05") %>%
+  select(-association_strength_col1, -association_strength_col2) %>% 
+  mutate(correct = ifelse(trial_outcome_col1 %in% c("Match", "Mismatch"), 
+                          "Correct", "Incorrect"))
+
+results.plt2 %>% 
+  group_by(association_strength, correct) %>% 
+  mutate(time_diff = c(NA, diff(time))) %>% 
+  mutate(time_diff_back = lead(time_diff)) %>% 
+  mutate(time_diff = round(time_diff, 3),
+         time_diff_back = round(time_diff_back, 3)) %>% 
+  dplyr::filter(time_diff > sfreq | time_diff_back > sfreq | is.na(time_diff) | is.na(time_diff_back)) %>% 
+  ungroup() %>% 
+  select(association_strength, correct, time, time_diff, time_diff_back) %>% 
+  arrange(association_strength, correct, time) %>% 
+  mutate(is_solo_point = ifelse((is.na(time_diff) & time_diff_back > sfreq) |
+                                  (time_diff > sfreq & time_diff_back > sfreq), T, F)) %>% 
+  group_by(association_strength, correct, is_solo_point) %>% 
+  mutate(index_parity = if_else(row_number() %% 2 == 1, "start", "end")) %>% 
+  mutate(index_parity = if_else(is_solo_point, "start", index_parity)) %>% 
+  mutate(time_period = round(row_number()+1/2) / 2) %>% 
+  ungroup() %>% 
+  select(-time_diff, -time_diff_back) %>% 
+  pivot_wider(names_from=c("index_parity"),
+              values_from = "time") %>%
+  select(-time_period, -is_solo_point) %>% 
+  kable() %>% 
+  kable_styling()
+
+power.summarized %>% 
+  mutate(across(trial_outcome,
+                factor,
+                levels = level_order)) %>% 
+  mutate(correct = ifelse(trial_outcome %in% c("Match", "Mismatch"), 
+                          "Correct", "Incorrect")) %>% 
+  mutate(trial_type = ifelse(trial_outcome %in% c("Match", "Miss"), 
+                             "Match", "Mismatch")) %>% 
+  summarySEwithin(.,
+                  measurevar="power",
+                  withinvars=c("association_strength",
+                               "trial_outcome",
+                               "trial_type",
+                               "correct",
+                               "customlinetype",
+                               "time"),
+                  idvar="subjectId") %>%
+  ggplot(aes(x = as.numeric(as.character(time)), 
+             y = power,
+             color = trial_type,
+             fill = trial_type)) +
+  geom_ribbon(aes(ymin=power-se, ymax=power+se),
+              color=NA,
+              alpha=0.3) +
+  geom_line(aes(linetype = factor(customlinetype)),
+            linewidth = 1) +
+  # # mark significant difference
+  # geom_point(aes(x = time,
+  #                y = ymin.power),
+  #            color = "gray37",
+  #            fill = "gray37",
+  #            show.legend = F,
+  #            data = results.plt2,
+  #            size = 0.5) +
+  geom_vline(xintercept = c(0, 1, 2, 2.75),
+             linetype = "dashed",
+             color = "gray37") +
+  labs(x = "Time (s)",
+       y = paste(y_axis_power_label, "power", sep=" "),
+       title = "") +
+  facet_grid(rows = vars(correct),
+             cols = vars(association_strength)) +
+  geom_text(aes(label = event,
+                x = time,
+                y = position),
+            data = ret_labels,
+            inherit.aes = FALSE,
+            angle = 90,
+            hjust = 1,
+            vjust = 1.3,
+            size = 3.5,
+            colour = "gray37",
+            family = fontfamily) +
+  guides(linetype = "none") + 
+  scale_color_manual(values=c("#1a75ff", "#ff751a", "#1a75ff", "#ff751a"), name="") + 
+  scale_fill_manual(values=c("#1a75ff", "#ff751a", "#1a75ff", "#ff751a"), name="") + 
+  theme(strip.text.x = element_text(size=12),
+        strip.text.y = element_text(size=12))
+
+
+###
+
+results.plt3 <- power.summarized %>% 
+  select(-customlinetype) %>% 
+  pivot_wider(names_from = c("association_strength", "trial_outcome"), 
+              values_from = "power") %>% 
+  group_by(time) %>% 
+  nest() %>%
+  mutate(
+    test_results = map(data, ~ {
+      column_pairs <- list(
+        c("Strong (4x)_Match", "Strong (4x)_Miss"),
+        c("Weak (1x)_Match", "Weak (1x)_Miss"),
+        c("Strong (4x)_Mismatch", "Strong (4x)_False alarm"),
+        c("Weak (1x)_Mismatch", "Weak (1x)_False alarm")
+      )
+      
+      # Perform the Wilcoxon signed-rank test for each column pair
+      map_dfr(column_pairs, function(cols) {
+        before_col <- cols[1]
+        after_col <- cols[2]
+        
+        # Check if columns exist in the dataframe
+        if (before_col %in% names(.x) & after_col %in% names(.x)) {
+          test <- wilcox.test(.x[[before_col]], .x[[after_col]], paired = TRUE)
+          tibble(
+            before_col = before_col,
+            after_col = after_col,
+            p_value = test$p.value,
+            test_statistic = test$statistic
+          )
+        } else {
+          tibble(
+            before_col = before_col,
+            after_col = after_col,
+            p_value = NA_real_,
+            test_statistic = NA_real_
+          )
+        }
+      })
+    })
+  ) %>%
+  unnest(cols = c(test_results)) %>% 
+  select(-data) %>% 
+  separate(before_col, into = c("association_strength_col1", "trial_outcome_col1"), sep = "_") %>% 
+  separate(after_col, into = c("association_strength_col2", "trial_outcome_col2"), sep = "_") %>% 
+  mutate(p.adj = p.adjust(p_value, method = "BY"))
+
+results.plt3 <- results.plt3 %>%
+  dplyr::filter(p.adj < 0.05) %>%
+  dplyr::filter(association_strength_col1 == association_strength_col2) %>%
+  mutate(association_strength = association_strength_col1,
+         trial_type = ifelse(trial_outcome_col1 %in% c("Match", "Miss"), 
+                             "Match", "Mismatch")) %>%
+  select(-association_strength_col1, -association_strength_col2) %>% 
+  mutate(correct = ifelse(trial_outcome_col1 %in% c("Match", "Mismatch"), 
+                          "Correct", "Incorrect"))
+
+
+results.plt3 %>% 
+  group_by(association_strength, trial_type) %>% 
+  mutate(time_diff = c(NA, diff(time))) %>% 
+  mutate(time_diff_back = lead(time_diff)) %>% 
+  mutate(time_diff = round(time_diff, 3),
+         time_diff_back = round(time_diff_back, 3)) %>% 
+  dplyr::filter(time_diff > sfreq | time_diff_back > sfreq | is.na(time_diff) | is.na(time_diff_back)) %>% 
+  ungroup() %>% 
+  select(association_strength, trial_type, time, time_diff, time_diff_back) %>% 
+  arrange(association_strength, trial_type, time) %>% 
+  mutate(is_solo_point = ifelse((is.na(time_diff) & time_diff_back > sfreq) |
+                                  (time_diff > sfreq & time_diff_back > sfreq), T, F)) %>% 
+  group_by(association_strength, trial_type, is_solo_point) %>% 
+  mutate(index_parity = if_else(row_number() %% 2 == 1, "start", "end")) %>% 
+  mutate(index_parity = if_else(is_solo_point, "start", index_parity)) %>% 
+  mutate(time_period = round(row_number()+1/2) / 2) %>% 
+  ungroup() %>% 
+  select(-time_diff, -time_diff_back) %>% 
+  pivot_wider(names_from=c("index_parity"),
+              values_from = "time") %>%
+  select(-time_period, -is_solo_point) %>% 
+  kable() %>% 
+  kable_styling()
+
+
+power.summarized %>% 
+  mutate(across(trial_outcome,
+                factor,
+                levels = level_order)) %>% 
+  mutate(correct = ifelse(trial_outcome %in% c("Match", "Mismatch"), 
+                          "Correct", "Incorrect")) %>% 
+  mutate(trial_type = ifelse(trial_outcome %in% c("Match", "Miss"), 
+                             "Match", "Mismatch")) %>% 
+  summarySEwithin(.,
+                  measurevar="power",
+                  withinvars=c("association_strength",
+                               "trial_outcome",
+                               "trial_type",
+                               "correct",
+                               "customlinetype",
+                               "time"),
+                  idvar="subjectId") %>%
+  ggplot(aes(x = as.numeric(as.character(time)), 
+             y = power,
+             color = trial_outcome,
+             fill = trial_outcome)) +
+  geom_ribbon(aes(ymin=power-se, ymax=power+se),
+              color=NA,
+              alpha=0.3) +
+  geom_line(aes(linetype = factor(customlinetype)),
+            linewidth = 1) +
+  # # mark significant difference
+  # geom_point(aes(x = time,
+  #                y = ymin.power),
+  #            color = "gray37",
+  #            fill = "gray37",
+  #            show.legend = F,
+  #            data = results.plt3,
+  #            size = 0.5) +
+  geom_vline(xintercept = c(0, 1, 2, 2.75),
+             linetype = "dashed",
+             color = "gray37") +
+  labs(x = "Time (s)",
+       y = paste(y_axis_power_label, "power", sep=" "),
+       title = "") +
+  facet_grid(rows = vars(trial_type),
+             cols = vars(association_strength)) +
+  geom_text(aes(label = event,
+                x = time,
+                y = position),
+            data = ret_labels,
+            inherit.aes = FALSE,
+            angle = 90,
+            hjust = 1,
+            vjust = 1.3,
+            size = 3.5,
+            colour = "gray37",
+            family = fontfamily) +
+  guides(color = "none",
+         fill = "none") + 
+  scale_color_manual(values=c("#1a75ff", "#ff751a", "#1a75ff", "#ff751a"), name="") + 
+  scale_fill_manual(values=c("#1a75ff", "#ff751a", "#1a75ff", "#ff751a"), name="") + 
+  theme(strip.text.x = element_text(size=12),
+        strip.text.y = element_text(size=12)) + 
+  scale_linetype_manual(name = "",
+                        labels = c("Correct", "Incorrect"),
+                        values = c("solid", "dashed"))
+
+```
+
+## Load clusters
+
+```{r load_clusters, echo=F}
+exclude.subs <- c("MPE101",
+                  "MPE102",
+                  "MPE104",
+                  "MPE106",
+                  "MPE112",
+                  "MPE113",
+                  "MPE116",
+                  "MPE118",
+                  "MPE119",
+                  "MPE121",
+                  "MPE122",
+                  "MPE126",
+                  "MPE129",
+                  "MPE130",
+                  "MPE132",
+                  "MPE133",
+                  "MPE136",
+                  "MPE138",
+                  "MPE140",
+                  "MPE142",
+                  "MPE143",
+                  "MPE144",
+                  "MPE145",
+                  "MPE148",
+                  "MPE149")
+
+```
+
+
+```{r power_plots, echo=F, fig.width=8, fig.height=8}
+
+match.power.plt <- power.summarized %>%
+  summarySEwithin(.,
+                  measurevar="power",
+                  withinvars=c("association_strength",
+                               "trial_outcome",
+                               "customlinetype",
+                               "time"),
+                  idvar="subjectId") %>%
+  dplyr::filter(trial_outcome == "Match") %>%
+  ggplot(aes(x = as.numeric(as.character(time)),
+             y = power,
+             color = association_strength,
+             fill = association_strength)) +
+  geom_ribbon(aes(ymin=power-se, ymax=power+se),
+              color=NA,
+              alpha=0.3) +
+  geom_line(aes(linetype = factor(customlinetype)),
+            linewidth = 1) +
+  geom_vline(xintercept = c(0, 1, 2, 2.75),
+             linetype = "dashed",
+             color = "gray37") +
+  labs(x = "Time (s)",
+       y = "Power",
+       title = "") +
+  facet_wrap(~factor(trial_outcome, level = level_order), nrow=2) +
+  geom_text(aes(label = event,
+                x = time,
+                y = position),
+            data = ret_labels,
+            inherit.aes = FALSE,
+            angle = 90,
+            hjust = 1,
+            vjust = 1.3,
+            size = 3,
+            colour = "gray37",
+            family = fontfamily) +
+  guides(linetype = "none") +
+  scale_color_manual(values=palette, name="") +
+  scale_fill_manual(values=palette, name="") +
+  theme(strip.text.x = element_text(size=8),
+        strip.text.y = element_text(size=8),
+        axis.text.x = element_text(size=8),
+        axis.text.y = element_text(size=8),
+        legend.position="none")
+
+small.power.plt <- power.summarized %>% 
+  mutate(across(trial_outcome,
+                factor,
+                levels = level_order)) %>% 
+  mutate(correct = ifelse(trial_outcome %in% c("Match", "Mismatch"), 
+                          "Correct", "Incorrect")) %>% 
+  mutate(trial_type = ifelse(trial_outcome %in% c("Match", "Miss"), 
+                             "Match", "Mismatch")) %>% 
+  summarySEwithin(.,
+                  measurevar="power",
+                  withinvars=c("association_strength",
+                               "trial_outcome",
+                               "trial_type",
+                               "correct",
+                               "customlinetype",
+                               "time"),
+                  idvar="subjectId") %>%
+  ggplot(aes(x = as.numeric(as.character(time)), 
+             y = power,
+             color = trial_type,
+             fill = trial_type)) +
+  geom_ribbon(aes(ymin=power-se, ymax=power+se),
+              color=NA,
+              alpha=0.3) +
+  geom_line(aes(linetype = factor(customlinetype)),
+            linewidth = 1) +
+  geom_vline(xintercept = c(0, 1, 2, 2.75),
+             linetype = "dashed",
+             color = "gray37") +
+  labs(x = "Time (s)",
+       y = "Power",
+       title = "") +
+  facet_wrap(~association_strength, ncol=1) +
+  guides(linetype = "none") + 
+  scale_color_manual(values=c("#1a75ff", "#ff751a", "#80b3ff", "#ffb380"), name="") + 
+  scale_fill_manual(values=c("#1a75ff", "#ff751a","#80b3ff", "#ffb380"), name="") + 
+  theme(strip.text.x = element_text(size=12),
+        strip.text.y = element_text(size=12),
+        axis.text.x = element_text(size=8),
+        axis.text.y = element_text(size=8),
+        legend.position="none")
+
+```
+
+
+## Betas
+
+```{r get_betas, echo=F}
+compute_betas <- T
+
+if (file.exists(paste("power", power_name, "betas_include_incorrect.RData", 
+                      sep="_")) & !compute_betas) {
+  load(paste("power", power_name, "betas_include_incorrect.RData", 
+             sep="_"))
+}
+
+if (compute_betas) {
+  power.betas <- power %>%
+    dplyr::filter(!subjectId %in% exclude.subs) %>% 
+    mutate(is_mismatch = if_else(trial_outcome %in% c("Hit", "Miss"),
+                                 0,
+                                 1)) %>% 
+    mutate(is_incorrect = if_else(trial_outcome %in% c("Hit", "CR"),
+                                  0,
+                                  1)) %>% 
+    group_by(subjectId, time) %>% 
+    group_modify(~ tidy(lm(power ~ association_strength * 
+                             is_mismatch * 
+                             is_incorrect, 
+                           data = .x)))
+}
+
+power.betas %>% 
+  dplyr::filter(is.na(estimate)) %>% 
+  pull(subjectId) %>% 
+  unique() %>% 
+  kable(caption="Subjects for whom model fitting did not work") %>% 
+  kable_styling()
+
+print(paste("N subjects:", 
+            length(power.betas %>% pull(subjectId) %>% unique())))
+```
+
+```{r create_table, echo=F}
+trial_counts <- power %>% 
+  dplyr::filter(!subjectId %in% exclude.subs) %>% 
+  mutate(is_mismatch = if_else(trial_outcome %in% c("Hit", "Miss"),
+                               0,
+                               1)) %>% 
+  mutate(is_incorrect = if_else(trial_outcome %in% c("Hit", "CR"),
+                                0,
+                                1)) %>% 
+  dplyr::filter(time == 0) %>% 
+  group_by(subjectId, association_strength, is_mismatch, is_incorrect) %>%
+  summarize(trial_count = n()) %>% 
+  mutate(trial_outcome = case_when(is_mismatch & is_incorrect ~ "FA",
+                                   is_mismatch & !is_incorrect ~ "CR",
+                                   !is_mismatch & is_incorrect ~ "Miss",
+                                   !is_mismatch & !is_incorrect ~ "Hit"))
+
+
+trial_counts %>% 
+  mutate(across(trial_outcome, 
+                factor, 
+                levels=c("Hit", "CR", "Miss", "FA"))) %>%
+  ggplot(aes(x = trial_outcome,
+             y = trial_count)) +
+  stat_summary(fun = "mean", 
+               geom = "bar", 
+               color = "black", 
+               position=position_dodge()) +
+  stat_summary(fun.data = "mean_cl_boot",
+               geom = "linerange")
+
+trial_counts %>% 
+  kable() %>% 
+  kable_styling()
+```
+
+```{r plot_betas_all, echo=F}
+
+power.betas %>% 
+  group_by(time, term) %>% 
+  summarize(se = sd(estimate, na.rm=T) / sqrt(sum(!is.na(estimate))),
+            estimate = mean(estimate, na.rm=T)) %>% 
+  ungroup() %>% 
+  ggplot(aes(x=as.numeric(as.character(time)), 
+             y=estimate,
+             color=term,
+             fill=term)) + 
+  geom_ribbon(aes(ymin=estimate-se, ymax=estimate+se),
+              color=NA,
+              alpha=0.3) +
+  geom_line(linewidth = 1) +
+  geom_vline(xintercept = c(0, 1, 2, 2.75),
+             linetype = "dashed",
+             color = "gray37") +
+  geom_hline(yintercept = c(0),
+             linetype = "longdash",
+             color = "gray37") +
+  labs(x = "Time (s)",
+       y = paste(y_axis_power_label, greek.beta, "weights (a.u.)", sep=" "),
+       title = "") +
+  # geom_text(aes(label = event,
+  #               x = time,
+  #               y = 0.55),
+  #           data = ret_labels,
+  #           inherit.aes = FALSE,
+  #           angle = 90, 
+  #           hjust = 1,
+  #           vjust = 1.3,
+  #           size = 3.5,
+  #           colour = "gray37",
+  #           family = fontfamily) + 
+  guides(linetype = "none") + 
+  facet_wrap(~term) +
+  scale_color_manual(values=beta_palette, name="") + 
+  scale_fill_manual(values=beta_palette, name="") + 
+  theme(strip.text.x = element_text(size=12),
+        strip.text.y = element_text(size=12))
+```
+
+```{r plot_betas, echo=F, fig.width=4, fig.height=7, results="asis"}
+betas.df <- power.betas %>% 
+  group_by(time, term) %>% 
+  summarize(se = sd(estimate, na.rm=T) / sqrt(sum(!is.na(estimate))),
+            estimate = mean(estimate, na.rm=T)) %>% 
+  ungroup() %>% 
+  mutate(term = case_when(term == "(Intercept)" ~ "Intercept",
+                          term == "is_mismatch" ~ "Mismatch v. Match",
+                          term == "is_incorrect" ~ "Incorrect v. Correct",
+                          term == "association_strengthWeak (1x)" ~ "Memory strength (Weak v. Strong)",
+                          term == "association_strengthWeak (1x):is_mismatch" ~ "Mismatch effect x Memory strength",
+                          term == "association_strengthWeak (1x):is_incorrect" ~ "Accuracy x Memory strength",
+                          term == "is_mismatch:is_incorrect" ~ "Mismatch effect x Accuracy",
+                          term == "association_strengthWeak (1x):is_mismatch:is_incorrect" ~ "Mismatch x Accuracy x Strength",
+                          .default="")) %>% 
+  dplyr::filter(term != "") %>% 
+  mutate(across(term,
+                factor,
+                levels = c("Intercept",
+                           "Mismatch v. Match",
+                           "Incorrect v. Correct",
+                           "Memory strength (Weak v. Strong)",
+                           "Mismatch effect x Memory strength",
+                           "Mismatch effect x Accuracy",
+                           "Accuracy x Memory strength",
+                           "Mismatch x Accuracy x Strength")))
+
+results.betas <- power.betas %>% 
+  group_by(time, term) %>% 
+  summarise(t_test = list(t.test(estimate))) %>%
+  mutate(
+    t_statistic = sapply(t_test, function(x) x$statistic),
+    p_value = sapply(t_test, function(x) x$p.value),
+    conf_int_lower = sapply(t_test, function(x) x$conf.int[1]),
+    conf_int_upper = sapply(t_test, function(x) x$conf.int[2])
+  ) %>%
+  select(-t_test) %>% 
+  #mutate(p.adj = p.adjust(p_value, method = "BY")) %>% 
+  mutate(p.adj = p_value) %>% 
+  ungroup()
+
+if (power_name == "frontal-theta") {
+  results.betas <- results.betas %>%
+    mutate(ypos = case_when(term == "is_mismatch" ~ -0.2,
+                            term == "is_incorrect" ~ -0.3,
+                            term == "association_strengthWeak (1x)" ~ -0.2,
+                            term == "association_strengthWeak (1x):is_mismatch" ~ -0.7,
+                            term == "association_strengthWeak (1x):is_incorrect" ~ -1,
+                            term == "is_mismatch:is_incorrect" ~ -0.9,
+                            term == "association_strengthWeak (1x):is_mismatch:is_incorrect" ~ -0.6,
+                            .default = 0))
+} else if (power_name == "posterior-alpha") {
+  results.betas <- results.betas %>%
+    mutate(ypos = case_when(term == "is_mismatch" ~ -0.3,
+                            term == "is_incorrect" ~ -0.6,
+                            term == "association_strengthWeak (1x)" ~ -0.3,
+                            term == "association_strengthWeak (1x):is_mismatch" ~ -0.3,
+                            term == "association_strengthWeak (1x):is_incorrect" ~ -0.3,
+                            term == "is_mismatch:is_incorrect" ~ -0.3,
+                            term == "association_strengthWeak (1x):is_mismatch:is_incorrect" ~ -1,
+                            .default = 0))
+}
+
+results.betas <- results.betas %>%
+  dplyr::filter(p.adj < 0.05) %>% 
+  mutate(term = case_when(term == "is_mismatch" ~ "Mismatch v. Match",
+                          term == "is_incorrect" ~ "Incorrect v. Correct",
+                          term == "association_strengthWeak (1x)" ~ "Memory strength (Weak v. Strong)",
+                          term == "association_strengthWeak (1x):is_mismatch" ~ "Mismatch effect x Memory strength",
+                          term == "association_strengthWeak (1x):is_incorrect" ~ "Accuracy x Memory strength",
+                          term == "is_mismatch:is_incorrect" ~ "Mismatch effect x Accuracy",
+                          term == "association_strengthWeak (1x):is_mismatch:is_incorrect" ~ "Mismatch x Accuracy x Strength",
+                          .default="")) %>% 
+  dplyr::filter(term != "") %>% 
+  mutate(across(term,
+                factor,
+                levels = c("Mismatch v. Match",
+                           "Incorrect v. Correct",
+                           "Memory strength (Weak v. Strong)",
+                           "Mismatch effect x Memory strength",
+                           "Mismatch effect x Accuracy",
+                           "Accuracy x Memory strength",
+                           "Mismatch x Accuracy x Strength")))
+
+clusters <- results.betas %>% 
+  group_by(term) %>% 
+  mutate(time_diff = c(NA, diff(time))) %>% 
+  mutate(time_diff_back = lead(time_diff)) %>% 
+  mutate(time_diff = round(time_diff, 3),
+         time_diff_back = round(time_diff_back, 3)) %>% 
+  dplyr::filter(time_diff > sfreq | time_diff_back > sfreq | is.na(time_diff) | is.na(time_diff_back)) %>% 
+  ungroup() %>% 
+  select(term, time, time_diff, time_diff_back) %>% 
+  arrange(term, time) %>% 
+  dplyr::filter(time_diff_back == sfreq | time_diff == sfreq) %>% 
+  mutate(is_solo_point = ifelse(is.na(time_diff) & time_diff_back > sfreq, T, F)) %>% 
+  group_by(term, is_solo_point) %>% 
+  mutate(index_parity = if_else(row_number() %% 2 == 1, "start", "end")) %>% 
+  mutate(time_period = round(row_number()+1/2) / 2) %>% 
+  ungroup() %>% 
+  select(-time_diff, -time_diff_back) %>% 
+  pivot_wider(names_from=c("index_parity"),
+              values_from = "time") %>% 
+  select(-time_period, -is_solo_point) %>% 
+  mutate(cluster_size = end-start) %>% 
+  mutate(cluster_id = row_number())
+
+if (!"cluster.id" %in% colnames(results.betas) | compute_betas) {
+  results.betas <- fuzzy_left_join(
+    results.betas, 
+    clusters %>% 
+      mutate(term = as.character(term)) %>% 
+      rename(cluster.term = term),
+    by = c("time" = "start", "time" = "end", "term" = "cluster.term"),
+    match_fun = list(`>=`, `<=`, `==`)
+  ) %>% 
+    dplyr::filter(!is.na(cluster_id))
+}
+
+cluster_beta_means <- fuzzy_left_join(
+  power.betas %>% 
+    mutate(term = case_when(term == "(Intercept)" ~ "Intercept",
+                            term == "is_mismatch" ~ "Mismatch v. Match",
+                            term == "is_incorrect" ~ "Incorrect v. Correct",
+                            term == "association_strengthWeak (1x)" ~ "Memory strength (Weak v. Strong)",
+                            term == "association_strengthWeak (1x):is_mismatch" ~ "Mismatch effect x Memory strength",
+                            term == "association_strengthWeak (1x):is_incorrect" ~ "Accuracy x Memory strength",
+                            term == "is_mismatch:is_incorrect" ~ "Mismatch effect x Accuracy",
+                            term == "association_strengthWeak (1x):is_mismatch:is_incorrect" ~ "Mismatch x Accuracy x Strength",
+                            .default="")), 
+  clusters %>% 
+    mutate(term = as.character(term)) %>% 
+    rename(cluster.term = term),
+  by = c("time" = "start", "time" = "end", "term" = "cluster.term"),
+  match_fun = list(`>=`, `<=`, `==`)
+) %>% 
+  dplyr::filter(!is.na(cluster_id))
+
+clusters %>% 
+  left_join(
+    cluster_beta_means %>% 
+      group_by(subjectId, cluster_id) %>% 
+      summarize(beta = mean(estimate)) %>% 
+      group_by(cluster_id) %>% 
+      summarize(mean_beta = mean(beta),
+                se = sd(beta) / sqrt(n()),
+                lower_ci = mean_beta - 1.96 * se,
+                upper_ci = mean_beta + 1.96 * se
+      ) %>% 
+      select(-se), 
+    by = "cluster_id") %>% 
+  kable(digits=3) %>% 
+  kable_styling()
+
+if (power_name == "frontal-theta") {
+  beta.event.y <- 0.5
+} else if (power_name == "posterior-alpha") {
+  beta.event.y <- 0.3
+}
+
+
+beta.plt <- betas.df %>% 
+  ggplot(aes(x=as.numeric(as.character(time)), 
+             y=estimate,
+             color=term,
+             fill=term)) + 
+  geom_ribbon(aes(ymin=estimate-se, ymax=estimate+se),
+              color=NA,
+              alpha=0.3) +
+  geom_line(linewidth = 1) +
+  geom_vline(xintercept = c(0, 1, 2, 2.75),
+             linetype = "dashed",
+             color = "gray37") +
+  geom_hline(yintercept = c(0),
+             linetype = "longdash",
+             color = "gray37") +
+  # mark significant difference
+  geom_point(aes(x = time,
+                 y = ypos,
+                 color=term),
+             show.legend = F,
+             data = results.betas,
+             size = 0.3) +
+  labs(x = "Time (s)",
+       y = paste(y_axis_power_label, greek.beta, "weights (a.u.)", sep=" "),
+       title = "") +
+  # geom_text(aes(label = event,
+  #               x = time,
+  #               y = beta.event.y),
+  #           data = ret_labels,
+  #           inherit.aes = FALSE,
+  #           angle = 90, 
+  #           hjust = 1,
+  #           vjust = 1.3,
+  #           size = 3.5,
+  #           colour = "gray37",
+  #           family = fontfamily) + 
+  guides(color="none",
+         fill="none") + 
+  facet_wrap(~term, ncol=1, scales="free_y", strip.position="top") +
+  scale_color_manual(values=beta_palette, name="") + 
+  scale_fill_manual(values=beta_palette, name="") + 
+  theme(strip.text.x = element_text(size=12),
+        plot.title = element_blank())
+
+beta.plt
+
+```
+
+
+
+```{r beta_joint_plt, echo=F, fig.width=4, fig.height=8}
+timeseries.plt <- power.summarized %>% 
+  summarySEwithin(.,
+                  measurevar="power",
+                  withinvars=c("association_strength",
+                               "trial_outcome",
+                               "time"),
+                  idvar="subjectId") %>%
+  mutate(customlinetype = ifelse(trial_outcome %in% c("Match", "Mismatch"),
+                                 0,
+                                 1)) %>% 
+  mutate(across(trial_outcome,
+                factor,
+                levels = level_order)) %>% 
+  ggplot(aes(x = as.numeric(as.character(time)), 
+             y = power,
+             color = trial_outcome,
+             fill = trial_outcome)) +
+  geom_ribbon(aes(ymin=power-se, ymax=power+se),
+              color=NA,
+              alpha=0.3) +
+  geom_line(aes(linetype = factor(customlinetype)),
+            linewidth = 1) +
+  geom_vline(xintercept = c(0, 1, 2, 2.75),
+             linetype = "dashed",
+             color = "gray37") +
+  labs(x = "Time (s)",
+       y = paste(y_axis_power_label, "(z)", sep=" "),
+       title = "") +
+  facet_grid(cols = vars(association_strength)) +
+  # geom_text(aes(label = event,
+  #               x = time,
+  #               y = 1.3),
+  #           data = ret_labels,
+  #           inherit.aes = FALSE,
+  #           angle = 90, 
+  #           hjust = 1,
+  #           vjust = 1.3,
+  #           size = 3.5,
+  #           colour = "gray37",
+  #           family = fontfamily) + 
+  guides(linetype = "none") + 
+  scale_color_manual(values=c("#1a75ff", "#ff751a", "#80b3ff", "#ffb380"), name="") + 
+  scale_fill_manual(values=c("#1a75ff", "#ff751a","#80b3ff", "#ffb380"), name="") + 
+  theme(strip.text.x = element_text(size=12),
+        strip.text.y = element_text(size=12),
+        plot.title = element_blank())
+
+timeseries.plt +
+  beta.plt + 
+  plot_layout(heights = c(2, 12),
+              guides = "collect") & theme(legend.position = "top")
+
+```
+
+```{r, echo=F, fig.width=4, fig.height=14, eval=T, results="asis"}
+
+beta.no.intercept.plt <- betas.df %>% 
+  dplyr::filter(term != "Intercept") %>% 
+  ggplot(aes(x=as.numeric(as.character(time)), 
+             y=estimate,
+             color=term,
+             fill=term)) + 
+  geom_ribbon(aes(ymin=estimate-se, ymax=estimate+se),
+              color=NA,
+              alpha=0.3) +
+  geom_line(linewidth = 1) +
+  geom_vline(xintercept = c(0, 1, 2, 2.75),
+             linetype = "dashed",
+             color = "gray37") +
+  geom_hline(yintercept = c(0),
+             linetype = "longdash",
+             color = "gray37") +
+  # mark significant difference
+  geom_point(aes(x = time,
+                 y = ypos,
+                 color=term),
+             show.legend = F,
+             data = results.betas,
+             size = 0.3) +
+  labs(x = "Time (s)",
+       y = paste(y_axis_power_label, greek.beta, "weights (a.u.)", sep=" "),
+       title = "") +
+  # geom_text(aes(label = event,
+  #               x = time,
+  #               y = beta.event.y),
+  #           data = ret_labels,
+  #           inherit.aes = FALSE,
+  #           angle = 90, 
+  #           hjust = 1,
+  #           vjust = 1.3,
+  #           size = 3.5,
+  #           colour = "gray37",
+  #           family = fontfamily) + 
+  guides(color="none",
+         fill="none") + 
+  facet_wrap(~term, ncol=1, scales="free_y", strip.position="top") +
+  scale_color_manual(values=beta_palette[2:8], name="") + 
+  scale_fill_manual(values=beta_palette[2:8], name="") + 
+  theme(strip.text.x = element_text(size=12),
+        plot.title = element_blank())
+
+timeseries.plt <- power.summarized %>% 
+  summarySEwithin(.,
+                  measurevar="power",
+                  withinvars=c("association_strength",
+                               "trial_outcome",
+                               "time"),
+                  idvar="subjectId") %>%
+  mutate(customlinetype = ifelse(trial_outcome %in% c("Match", "Mismatch"),
+                                 0,
+                                 1)) %>% 
+  mutate(across(trial_outcome,
+                factor,
+                levels = level_order)) %>% 
+  ggplot(aes(x = as.numeric(as.character(time)), 
+             y = power,
+             color = trial_outcome,
+             fill = trial_outcome)) +
+  geom_ribbon(aes(ymin=power-se, ymax=power+se),
+              color=NA,
+              alpha=0.3) +
+  geom_line(aes(linetype = factor(customlinetype)),
+            linewidth = 1) +
+  geom_vline(xintercept = c(0, 1, 2, 2.75),
+             linetype = "dashed",
+             color = "gray37") +
+  labs(x = "Time (s)",
+       y = paste(y_axis_power_label, "(z)", sep=" "),
+       title = "") +
+  facet_wrap(~association_strength, ncol=1, strip.position="top") +
+  geom_text(aes(label = event,
+                x = time,
+                y = position),
+            data = ret_labels,
+            inherit.aes = FALSE,
+            angle = 90,
+            hjust = 1,
+            vjust = 1.3,
+            size = 3.5,
+            colour = "gray37",
+            family = fontfamily) +
+  guides(linetype = "none") + 
+  scale_color_manual(values=c("#1a75ff", "#ff751a", "#80b3ff", "#ffb380"), name="") + 
+  scale_fill_manual(values=c("#1a75ff", "#ff751a","#80b3ff", "#ffb380"), name="") + 
+  theme(strip.text.x = element_text(size=12),
+        strip.text.y = element_text(size=12),
+        plot.title = element_blank())
+
+(timeseries.plt + 
+    guides(color=guide_legend(nrow=2))) /
+  beta.no.intercept.plt + 
+  plot_layout(heights = c(15, 40),
+              guides = "collect") & theme(legend.position = "top")
+
+```
+
+## Cluster correction
+
+```{r permute, eval=T, echo=F}
+n_permutations <- 1000
+
+run_permutation_test <- T
+
+if (run_permutation_test) {
+  permute_betas <- function(data, n_permutations) {
+    results <- replicate(n_permutations, {
+      permuted_data <- data %>%
+        mutate(estimate = estimate * sample(c(-1, 1), n(), replace = TRUE))
+    }, simplify = FALSE)
+    bind_rows(results, .id = "permutation")
+  }
+  
+  betas.permuted <- power.betas %>%
+    group_by(subjectId, term) %>%
+    group_modify(~ permute_betas(.x, n_permutations = n_permutations)) %>%
+    ungroup() 
+  
+  tstats.permuted <- betas.permuted %>% 
+    group_by(permutation, time, term) %>% 
+    summarise(t_test = list(t.test(estimate))) %>%
+    mutate(
+      t_statistic = sapply(t_test, function(x) x$statistic),
+      p_value = sapply(t_test, function(x) x$p.value),
+      conf_int_lower = sapply(t_test, function(x) x$conf.int[1]),
+      conf_int_upper = sapply(t_test, function(x) x$conf.int[2])
+    ) %>%
+    select(-t_test) %>% 
+    mutate(p.adj = p_value) %>% 
+    ungroup() %>% 
+    dplyr::filter(p.adj < 0.05) %>% 
+    mutate(term = case_when(term == "association_strengthWeak (1x)" ~ "Memory strength (Weak v. Strong)",
+                            term == "association_strengthWeak (1x):is_mismatch" ~ "Mismatch effect x Memory strength",
+                            term == "is_mismatch" ~ "Mismatch v. Match",
+                            .default="")) %>% 
+    dplyr::filter(term != "") %>% 
+    mutate(across(term,
+                  factor,
+                  levels = c("Mismatch v. Match",
+                             "Incorrect v. Correct",
+                             "Memory strength (Weak v. Strong)",
+                             "Mismatch effect x Memory strength",
+                             "Mismatch effect x Accuracy",
+                             "Accuracy x Memory strength",
+                             "Mismatch x Accuracy x Strength")))
+  
+  tstats.permuted.clusters <- tstats.permuted %>% 
+    group_by(permutation, term) %>% 
+    mutate(time_diff = c(NA, diff(time))) %>% 
+    mutate(time_diff_back = lead(time_diff)) %>% 
+    mutate(time_diff = round(time_diff, 3),
+           time_diff_back = round(time_diff_back, 3)) %>% 
+    dplyr::filter(time_diff > sfreq | time_diff_back > sfreq | is.na(time_diff) | is.na(time_diff_back)) %>% 
+    ungroup() %>% 
+    select(permutation, term, time, time_diff, time_diff_back) %>% 
+    arrange(permutation, term, time) %>% 
+    dplyr::filter(time_diff_back == sfreq | time_diff == sfreq) %>% 
+    mutate(is_solo_point = ifelse(is.na(time_diff) & time_diff_back > sfreq, T, F)) %>% 
+    group_by(permutation, term, is_solo_point) %>% 
+    mutate(index_parity = if_else(row_number() %% 2 == 1, "start", "end")) %>% 
+    mutate(time_period = round(row_number()+1/2) / 2) %>% 
+    ungroup() %>% 
+    select(-time_diff, -time_diff_back) %>% 
+    pivot_wider(names_from=c("index_parity"),
+                values_from = "time") %>% 
+    select(-time_period, -is_solo_point) %>% 
+    mutate(cluster_size = end-start) %>% 
+    dplyr::filter(!is.na(cluster_size)) %>% 
+    # check if t-values within suspected clusters have same sign (need contiguous clusters)
+    left_join(tstats.permuted %>%
+                select(permutation, time, term, t_statistic),
+              by = c("permutation", "term"),
+              multiple = "all",
+              relationship="many-to-many") %>%
+    dplyr::filter((time >= start) & (time <= end)) %>%
+    mutate(t_stat_is_positive = sign(t_statistic) == 1) %>%
+    group_by(permutation, term, start, end, cluster_size) %>%
+    # checking sign of start and end points
+    summarize(n_timepoints = n(),
+              t_stat_same_sign = mean(t_stat_is_positive),
+              t_stat_same_sign = t_stat_same_sign %in% c(0, 1)) %>%
+    ungroup() %>%
+    # select clusters where t stats at the start and end are the same (otherwise not a contiguous cluster)
+    dplyr::filter(t_stat_same_sign) %>%
+    left_join(clusters,
+              by = c("term"),
+              suffix = c(".permuted", ""),
+              multiple="all",
+              relationship="many-to-many") %>% 
+    mutate(larger_than_real_cluster = cluster_size.permuted > cluster_size) %>% 
+    group_by(permutation, term, cluster_id) %>% 
+    summarize(has_larger_cluster = max(larger_than_real_cluster)) %>% 
+    ungroup()
+}
+
+tstats.permuted.clusters %>% 
+  group_by(cluster_id, term) %>% 
+  summarize(
+    n.permutations.with.clusters = n(),
+    permuted.p.value = sum(has_larger_cluster)/n_permutations) %>% 
+  kable() %>% 
+  kable_styling()
+```
+
+
+# Response-locked time series
+
+```{r rt_locked_time_series, echo=F, fig.width=6, fig.height=3}
+time.around.rt <- 1
+
+power %>%
+  dplyr::filter(!subjectId %in% exclude.subs) %>% 
+  mutate(is_mismatch = if_else(trial_outcome %in% c("Hit", "Miss"),
+                               0,
+                               1)) %>% 
+  mutate(is_incorrect = if_else(trial_outcome %in% c("Hit", "CR"),
+                                0,
+                                1)) %>% 
+  group_by(subjectId) %>%
+  summarize(n.strength.unique = length(unique(association_strength)),
+            n.is_incorrect.unique = length(unique(is_incorrect)),
+            n.is_mismatch.unique = length(unique(is_mismatch))) %>% 
+  dplyr::filter(n.strength.unique < 2 | n.is_incorrect.unique < 2 | n.is_mismatch.unique < 2) %>% 
+  kable(caption="Participants with missing trials") %>% 
+  kable_styling()
+
+exclude.subs.df <- power %>%
+  dplyr::filter(!subjectId %in% exclude.subs) %>% 
+  mutate(is_mismatch = if_else(trial_outcome %in% c("Hit", "Miss"),
+                               0,
+                               1)) %>% 
+  mutate(is_incorrect = if_else(trial_outcome %in% c("Hit", "CR"),
+                                0,
+                                1)) %>% 
+  group_by(subjectId) %>%
+  summarize(n.strength.unique = length(unique(association_strength)),
+            n.is_mismatch.unique = length(unique(is_mismatch))) %>% 
+  dplyr::filter(n.strength.unique < 2 | n.is_mismatch.unique < 2)
+
+exclude.subs.df %>% 
+  kable(caption="Participants with missing trials") %>% 
+  kable_styling()
+
+# exclude.subs <- c(exclude.subs,
+#                   exclude.subs.df %>% 
+#                     pull(subjectId) %>% 
+#                     unique())
+
+rt.locked.data <- power %>%
+  dplyr::filter(!subjectId %in% exclude.subs) %>% 
+  dplyr::filter(match_response.rt <= 1 & match_response.rt >= 0.25) %>%
+  mutate(hit = is_match_trial & (match_response.keys==1)) %>%
+  mutate(false_alarm = !is_match_trial & (match_response.keys==1)) %>%
+  mutate(miss = is_match_trial & (match_response.keys==2)) %>%
+  mutate(correct_rejection = !is_match_trial & (match_response.keys==2)) %>%
+  mutate(customlinetype = ifelse(hit | correct_rejection,
+                                 0,
+                                 1)) %>% 
+  mutate(trial_outcome = case_when(hit ~ "Match",
+                                   false_alarm ~ "False alarm",
+                                   miss ~ "Miss",
+                                   correct_rejection ~ "Mismatch")) %>%
+  dplyr::filter(!is.na(match_response.rt)) %>%  
+  dplyr::filter(trial_outcome %in% c("Match", "False alarm", "Miss", "Mismatch")) %>% 
+  mutate(match_response.rt.rounded = round(match_response.rt, digits=3)) %>% 
+  mutate(match_response.rt.rounded = round(match_response.rt.rounded / sfreq) * sfreq) %>% 
+  mutate(time.since.rt = time - match_response.rt.rounded - 2) %>% 
+  mutate(time.since.rt = round(time.since.rt, 3))
+
+```
+
+```{r smoothed, echo=F, fig.width=6, fig.height=3}
+rt.locked.plt <- rt.locked.data %>% 
+  group_by(time.since.rt,
+           subjectId,
+           association_strength,
+           customlinetype,
+           trial_outcome) %>% 
+  summarize(power = mean(power)) %>% 
+  ungroup() %>% 
+  mutate(time = time.since.rt) %>% 
+  dplyr::filter(time > -time.around.rt & time < time.around.rt) %>% 
+  mutate(correct = ifelse(trial_outcome %in% c("Match", "Mismatch"), 
+                          "Correct", "Incorrect")) %>% 
+  mutate(across(trial_outcome,
+                factor,
+                levels = level_order)) %>% 
+  summarySEwithin(.,
+                  measurevar="power",
+                  withinvars=c("association_strength",
+                               "trial_outcome",
+                               "time"),
+                  idvar="subjectId") %>%
+  mutate(customlinetype = ifelse(trial_outcome %in% c("Match", "Mismatch"),
+                                 0,
+                                 1)) %>% 
+  ggplot(aes(x = as.numeric(as.character(time)), 
+             y = power,
+             color = trial_outcome,
+             fill = trial_outcome)) +
+  geom_ribbon(aes(ymin=power-se, ymax=power+se),
+              color=NA,
+              alpha=0.3) +
+  geom_line(aes(linetype = factor(customlinetype)),
+            linewidth = 1) +
+  geom_vline(xintercept = c(0),
+             linetype = "dashed",
+             color = "gray37") +
+  labs(x = "Time since response (s)",
+       y = paste(y_axis_power_label, "(z)", sep=" "),
+       title = "") +
+  facet_grid(cols = vars(association_strength)) +
+  guides(linetype = "none") + 
+  scale_x_continuous(breaks=c(-1, 0, 1)) + 
+  scale_color_manual(values=c("#1a75ff", "#ff751a", "#80b3ff", "#ffb380"), name="") + 
+  scale_fill_manual(values=c("#1a75ff", "#ff751a", "#80b3ff", "#ffb380"), name="") + 
+  theme(strip.text.x = element_text(size=12),
+        strip.text.y = element_text(size=12),
+        plot.title = element_blank())
+
+rt.locked.plt
+```
+
+## Betas
+
+```{r get_betas_rt, echo=F}
+if (compute_betas) {
+  power.rt.betas <- rt.locked.data %>%
+    dplyr::filter(!subjectId %in% exclude.subs) %>%
+    mutate(time = time.since.rt) %>% 
+    dplyr::filter(time > -time.around.rt & time < time.around.rt) %>% 
+    mutate_at(c('trial_outcome'), as.character) %>% 
+    mutate(is_mismatch = if_else(trial_outcome %in% c("Match", "Miss"),
+                                 0,
+                                 1)) %>% 
+    mutate(is_incorrect = if_else(trial_outcome %in% c("Match", "Mismatch"),
+                                  0,
+                                  1)) %>% 
+    group_by(subjectId, time) %>% 
+    group_modify(~ tidy(lm(power ~ association_strength * 
+                             is_mismatch * 
+                             is_incorrect, 
+                           data = .x)))
+} 
+
+power.rt.betas %>% 
+  dplyr::filter(is.na(estimate)) %>% 
+  kable(caption="Subjects for whom model fitting did not work") %>% 
+  kable_styling()
+
+print(paste("N subjects:", 
+            length(power.rt.betas %>% pull(subjectId) %>% unique())))
+```
+
+```{r plot_betas_all_rt, echo=F}
+
+power.rt.betas %>% 
+  group_by(time, term) %>% 
+  summarize(se = sd(estimate, na.rm=T) / sqrt(sum(!is.na(estimate))),
+            estimate = mean(estimate, na.rm=T)) %>% 
+  ungroup() %>% 
+  ggplot(aes(x=as.numeric(as.character(time)), 
+             y=estimate,
+             color=term,
+             fill=term)) + 
+  geom_ribbon(aes(ymin=estimate-se, ymax=estimate+se),
+              color=NA,
+              alpha=0.3) +
+  geom_line(linewidth = 1) +
+  geom_vline(xintercept = c(0),
+             linetype = "dashed",
+             color = "gray37") +
+  geom_hline(yintercept = c(0),
+             linetype = "longdash",
+             color = "gray37") +
+  labs(x = "Time (s)",
+       y = paste(y_axis_power_label, greek.beta, "weights (a.u.)", sep=" "),
+       title = "") +
+  guides(linetype = "none") + 
+  facet_wrap(~term) +
+  scale_color_manual(values=beta_palette, name="") + 
+  scale_fill_manual(values=beta_palette, name="") + 
+  theme(strip.text.x = element_text(size=12),
+        strip.text.y = element_text(size=12))
+```
+
+```{r plot_betas_rt, echo=F, fig.width=2.6, fig.height=7, results="asis"}
+betas.rt.df <- power.rt.betas %>% 
+  group_by(time, term) %>% 
+  summarize(se = sd(estimate, na.rm=T) / sqrt(sum(!is.na(estimate))),
+            estimate = mean(estimate, na.rm=T)) %>% 
+  ungroup() %>% 
+  mutate(term = case_when(term == "is_mismatch" ~ "Mismatch v. Match",
+                          term == "is_incorrect" ~ "Incorrect v. Correct",
+                          term == "association_strengthWeak (1x)" ~ "Memory strength (Weak v. Strong)",
+                          term == "association_strengthWeak (1x):is_mismatch" ~ "Mismatch effect x Memory strength",
+                          term == "association_strengthWeak (1x):is_incorrect" ~ "Accuracy x Memory strength",
+                          term == "is_mismatch:is_incorrect" ~ "Mismatch effect x Accuracy",
+                          term == "association_strengthWeak (1x):is_mismatch:is_incorrect" ~ "Mismatch x Accuracy x Strength",
+                          .default="")) %>% 
+  dplyr::filter(term != "") %>% 
+  mutate(across(term,
+                factor,
+                levels = c("Mismatch v. Match",
+                           "Incorrect v. Correct",
+                           "Memory strength (Weak v. Strong)",
+                           "Mismatch effect x Memory strength",
+                           "Mismatch effect x Accuracy",
+                           "Accuracy x Memory strength",
+                           "Mismatch x Accuracy x Strength")))
+
+results.rt.betas <- power.rt.betas %>% 
+  group_by(time, term) %>% 
+  summarise(t_test = list(t.test(estimate))) %>%
+  mutate(
+    t_statistic = sapply(t_test, function(x) x$statistic),
+    p_value = sapply(t_test, function(x) x$p.value),
+    conf_int_lower = sapply(t_test, function(x) x$conf.int[1]),
+    conf_int_upper = sapply(t_test, function(x) x$conf.int[2])
+  ) %>%
+  select(-t_test) %>% 
+  #mutate(p.adj = p.adjust(p_value, method = "BY")) %>% 
+  mutate(p.adj = p_value) %>% 
+  ungroup()
+
+if (power_name == "frontal-theta") {
+  results.rt.betas <- results.rt.betas %>%
+    mutate(ypos = case_when(term == "is_mismatch" ~ -0.2,
+                            term == "is_incorrect" ~ -0.4,
+                            term == "association_strengthWeak (1x)" ~ -0.2,
+                            term == "association_strengthWeak (1x):is_mismatch" ~ -0.7,
+                            term == "association_strengthWeak (1x):is_incorrect" ~ -0.6,
+                            term == "is_mismatch:is_incorrect" ~ -0.6,
+                            term == "association_strengthWeak (1x):is_mismatch:is_incorrect" ~ -0.1,
+                            .default = 0))
+  
+} else if (power_name == "posterior-alpha") {
+  results.rt.betas <- results.rt.betas %>%
+    mutate(ypos = case_when(term == "is_mismatch" ~ -0.2,
+                            term == "is_incorrect" ~ -0.5,
+                            term == "association_strengthWeak (1x)" ~ -0.3,
+                            term == "association_strengthWeak (1x):is_mismatch" ~ -0.2,
+                            term == "association_strengthWeak (1x):is_incorrect" ~ -0.3,
+                            term == "is_mismatch:is_incorrect" ~ -0.3,
+                            term == "association_strengthWeak (1x):is_mismatch:is_incorrect" ~ -0.7,
+                            .default = 0)) 
+}
+
+results.rt.betas <- results.rt.betas %>%
+  dplyr::filter(p.adj < 0.05) %>% 
+  mutate(term = case_when(term == "is_mismatch" ~ "Mismatch v. Match",
+                          term == "is_incorrect" ~ "Incorrect v. Correct",
+                          term == "association_strengthWeak (1x)" ~ "Memory strength (Weak v. Strong)",
+                          term == "association_strengthWeak (1x):is_mismatch" ~ "Mismatch effect x Memory strength",
+                          term == "association_strengthWeak (1x):is_incorrect" ~ "Accuracy x Memory strength",
+                          term == "is_mismatch:is_incorrect" ~ "Mismatch effect x Accuracy",
+                          term == "association_strengthWeak (1x):is_mismatch:is_incorrect" ~ "Mismatch x Accuracy x Strength",
+                          .default="")) %>% 
+  dplyr::filter(term != "") %>% 
+  mutate(across(term,
+                factor,
+                levels = c("Mismatch v. Match",
+                           "Incorrect v. Correct",
+                           "Memory strength (Weak v. Strong)",
+                           "Mismatch effect x Memory strength",
+                           "Mismatch effect x Accuracy",
+                           "Accuracy x Memory strength",
+                           "Mismatch x Accuracy x Strength")))
+
+
+if (nrow(results.rt.betas) > 0) {
+  clusters <- results.rt.betas %>% 
+    group_by(term) %>% 
+    mutate(time_diff = c(NA, diff(time))) %>% 
+    mutate(time_diff_back = lead(time_diff)) %>% 
+    mutate(time_diff = round(time_diff, 3),
+           time_diff_back = round(time_diff_back, 3)) %>% 
+    dplyr::filter(time_diff > sfreq | time_diff_back > sfreq | is.na(time_diff) | is.na(time_diff_back)) %>% 
+    ungroup() %>% 
+    select(term, time, time_diff, time_diff_back) %>% 
+    arrange(term, time) %>% 
+    dplyr::filter(time_diff_back == sfreq | time_diff == sfreq) %>% 
+    mutate(is_solo_point = ifelse(is.na(time_diff) & time_diff_back > sfreq, T, F)) %>% 
+    group_by(term, is_solo_point) %>% 
+    mutate(index_parity = if_else(row_number() %% 2 == 1, "start", "end")) %>% 
+    mutate(time_period = round(row_number()+1/2) / 2) %>% 
+    ungroup() %>% 
+    select(-time_diff, -time_diff_back) %>% 
+    pivot_wider(names_from=c("index_parity"),
+                values_from = "time") %>% 
+    select(-time_period, -is_solo_point) %>% 
+    mutate(cluster_size = end-start) %>% 
+    mutate(cluster_id = row_number())
+  
+  if (!"cluster.id" %in% colnames(results.rt.betas) | compute_betas) {
+    results.rt.betas <- fuzzy_left_join(
+      results.rt.betas, 
+      clusters %>% 
+        mutate(term = as.character(term)) %>% 
+        rename(cluster.term = term),
+      by = c("time" = "start", "time" = "end", "term" = "cluster.term"),
+      match_fun = list(`>=`, `<=`, `==`)
+    ) %>% 
+      dplyr::filter(!is.na(cluster_id))
+  }
+  
+  cluster_beta_means <- fuzzy_left_join(
+    power.rt.betas %>%
+      mutate(term = case_when(term == "is_mismatch" ~ "Mismatch v. Match",
+                              term == "is_incorrect" ~ "Incorrect v. Correct",
+                              term == "association_strengthWeak (1x)" ~ "Memory strength (Weak v. Strong)",
+                              term == "association_strengthWeak (1x):is_mismatch" ~ "Mismatch effect x Memory strength",
+                              term == "association_strengthWeak (1x):is_incorrect" ~ "Accuracy x Memory strength",
+                              term == "is_mismatch:is_incorrect" ~ "Mismatch effect x Accuracy",
+                              term == "association_strengthWeak (1x):is_mismatch:is_incorrect" ~ "Mismatch x Accuracy x Strength",
+                              .default="")),
+    clusters %>%
+      mutate(term = as.character(term)) %>%
+      rename(cluster.term = term),
+    by = c("time" = "start", "time" = "end", "term" = "cluster.term"),
+    match_fun = list(`>=`, `<=`, `==`)
+  ) %>%
+    dplyr::filter(!is.na(cluster_id))
+  
+  clusters %>% 
+    left_join(
+      cluster_beta_means %>% 
+        group_by(subjectId, cluster_id) %>% 
+        summarize(beta = mean(estimate)) %>% 
+        group_by(cluster_id) %>% 
+        summarize(mean_beta = mean(beta),
+                  se = sd(beta) / sqrt(n()),
+                  lower_ci = mean_beta - 1.96 * se,
+                  upper_ci = mean_beta + 1.96 * se
+        ) %>% 
+        select(-se), 
+      by = "cluster_id") %>% 
+    kable(digits=3) %>% 
+    kable_styling() %>% 
+    cat()
+}
+
+beta.plt <- betas.rt.df %>% 
+  ggplot(aes(x=as.numeric(as.character(time)), 
+             y=estimate,
+             color=term,
+             fill=term)) + 
+  geom_ribbon(aes(ymin=estimate-se, ymax=estimate+se),
+              color=NA,
+              alpha=0.3) +
+  geom_line(linewidth = 1) +
+  geom_vline(xintercept = c(0),
+             linetype = "dashed",
+             color = "gray37") +
+  geom_hline(yintercept = c(0),
+             linetype = "longdash",
+             color = "gray37") +
+  # mark significant difference
+  geom_point(aes(x = time,
+                 y = ypos,
+                 color=term),
+             show.legend = F,
+             data = results.rt.betas,
+             size = 0.3) +
+  labs(x = "Time since response (s)",
+       y = paste(y_axis_power_label, greek.beta, "weights (a.u.)", sep=" "),
+       title = "") +
+  guides(color="none",
+         fill="none") + 
+  facet_wrap(~term, ncol=1, scales="free_y", strip.position="top") +
+  scale_color_manual(values=beta_palette, name="") + 
+  scale_fill_manual(values=beta_palette, name="") + 
+  theme(strip.text.x = element_text(size=12),
+        strip.text.y = element_text(size=12),
+        plot.title = element_blank())
+
+beta.plt
+
+(rt.locked.plt + 
+    guides(color=guide_legend(nrow=2))) +
+  beta.plt + 
+  plot_layout(heights = c(2, 10),
+              guides = "collect") & 
+  theme(legend.position="top",
+        text = element_text(size=10),
+        strip.text.x = element_text(size=10),
+        legend.text=element_text(size=10))
+
+```
+
+
+```{r, echo=F, fig.width=3.2, fig.height=11, eval=T, results="asis"}
+
+beta.no.intercept.plt <- betas.rt.df %>% 
+  dplyr::filter(term != "Intercept") %>% 
+  ggplot(aes(x=as.numeric(as.character(time)), 
+             y=estimate,
+             color=term,
+             fill=term)) + 
+  geom_ribbon(aes(ymin=estimate-se, ymax=estimate+se),
+              color=NA,
+              alpha=0.3) +
+  geom_line(linewidth = 1) +
+  geom_vline(xintercept = c(0),
+             linetype = "dashed",
+             color = "gray37") +
+  geom_hline(yintercept = c(0),
+             linetype = "longdash",
+             color = "gray37") +
+  # mark significant difference
+  geom_point(aes(x = time,
+                 y = ypos,
+                 color=term),
+             show.legend = F,
+             data = results.rt.betas,
+             size = 0.3) +
+  labs(x = "Time (s)",
+       y = paste(y_axis_power_label, greek.beta, "weights (a.u.)", sep=" "),
+       title = "") +
+  guides(color="none",
+         fill="none") + 
+  facet_wrap(~term, ncol=1, scales="free_y", strip.position="top") +
+  scale_color_manual(values=beta_palette[2:8], name="") + 
+  scale_fill_manual(values=beta_palette[2:8], name="") + 
+  theme(strip.text.x = element_text(size=12),
+        plot.title = element_blank())
+
+timeseries.plt <- rt.locked.data %>% 
+  group_by(time.since.rt,
+           subjectId,
+           association_strength,
+           customlinetype,
+           trial_outcome) %>% 
+  summarize(power = mean(power)) %>% 
+  ungroup() %>% 
+  mutate(time = time.since.rt) %>% 
+  dplyr::filter(time > -time.around.rt & time < time.around.rt) %>% 
+  summarySEwithin(.,
+                  measurevar="power",
+                  withinvars=c("association_strength",
+                               "trial_outcome",
+                               "time"),
+                  idvar="subjectId") %>%
+  mutate(correct = ifelse(trial_outcome %in% c("Match", "Mismatch"), 
+                          "Correct", "Incorrect")) %>% 
+  mutate(customlinetype = ifelse(trial_outcome %in% c("Match", "Mismatch"),
+                                 0,
+                                 1)) %>% 
+  mutate(across(trial_outcome,
+                factor,
+                levels = level_order)) %>% 
+  ggplot(aes(x = as.numeric(as.character(time)), 
+             y = power,
+             color = trial_outcome,
+             fill = trial_outcome)) +
+  geom_ribbon(aes(ymin=power-se, ymax=power+se),
+              color=NA,
+              alpha=0.3) +
+  geom_line(aes(linetype = factor(customlinetype)),
+            linewidth = 1) +
+  geom_vline(xintercept = c(0),
+             linetype = "dashed",
+             color = "gray37") +
+  labs(x = "Time since response (s)",
+       y = paste(y_axis_power_label, "(z)", sep=" "),
+       title = "") +
+  facet_wrap(~association_strength, ncol=1, strip.position="top") +
+  guides(linetype = "none") + 
+  # scale_x_continuous(breaks=c(-1, 0, 1)) + 
+  scale_color_manual(values=c("#1a75ff", "#ff751a", "#80b3ff", "#ffb380"), name="") + 
+  scale_fill_manual(values=c("#1a75ff", "#ff751a", "#80b3ff", "#ffb380"), name="") + 
+  theme(strip.text.x = element_text(size=12),
+        strip.text.y = element_text(size=12),
+        plot.title = element_blank())
+
+(timeseries.plt + 
+    guides(color=guide_legend(nrow=2))) /
+  beta.no.intercept.plt + 
+  plot_layout(heights = c(15, 40),
+              guides = "collect") & theme(legend.position="top",
+                                          text = element_text(size=10),
+                                          strip.text.x = element_text(size=10),
+                                          legend.text=element_text(size=10))
+
+```
+
+## Cluster correction
+
+```{r permute_rt_betas, eval=T, echo=F}
+n_permutations <- 1000
+
+run_permutation_test <- T
+
+if (run_permutation_test) {
+  permute_betas <- function(data, n_permutations) {
+    results <- replicate(n_permutations, {
+      permuted_data <- data %>%
+        mutate(estimate = estimate * sample(c(-1, 1), n(), replace = TRUE)) 
+    }, simplify = FALSE)
+    bind_rows(results, .id = "permutation")
+  }
+  
+  betas.permuted <- power.rt.betas %>%
+    group_by(subjectId, term) %>%
+    group_modify(~ permute_betas(.x, n_permutations = n_permutations)) %>%
+    ungroup() 
+  
+  tstats.permuted <- betas.permuted %>% 
+    group_by(permutation, time, term) %>% 
+    summarise(t_test = list(t.test(estimate))) %>%
+    mutate(
+      t_statistic = sapply(t_test, function(x) x$statistic),
+      p_value = sapply(t_test, function(x) x$p.value),
+      conf_int_lower = sapply(t_test, function(x) x$conf.int[1]),
+      conf_int_upper = sapply(t_test, function(x) x$conf.int[2])
+    ) %>%
+    select(-t_test) %>% 
+    mutate(p.adj = p_value) %>% 
+    ungroup() %>% 
+    dplyr::filter(p.adj < 0.05) %>% 
+    mutate(term = case_when(term == "is_mismatch" ~ "Mismatch v. Match",
+                            term == "is_incorrect" ~ "Incorrect v. Correct",
+                            term == "association_strengthWeak (1x)" ~ "Memory strength (Weak v. Strong)",
+                            term == "association_strengthWeak (1x):is_mismatch" ~ "Mismatch effect x Memory strength",
+                            term == "association_strengthWeak (1x):is_incorrect" ~ "Accuracy x Memory strength",
+                            term == "is_mismatch:is_incorrect" ~ "Mismatch effect x Accuracy",
+                            term == "association_strengthWeak (1x):is_mismatch:is_incorrect" ~ "Mismatch x Accuracy x Strength",
+                            .default="")) %>% 
+    dplyr::filter(term != "") %>% 
+    mutate(across(term,
+                  factor,
+                  levels = c("Mismatch v. Match",
+                             "Incorrect v. Correct",
+                             "Memory strength (Weak v. Strong)",
+                             "Mismatch effect x Memory strength",
+                             "Mismatch effect x Accuracy",
+                             "Accuracy x Memory strength",
+                             "Mismatch x Accuracy x Strength")))
+  
+  tstats.permuted.rt.clusters <- tstats.permuted %>% 
+    group_by(permutation, term) %>% 
+    mutate(time_diff = c(NA, diff(time))) %>% 
+    mutate(time_diff_back = lead(time_diff)) %>% 
+    mutate(time_diff = round(time_diff, 3),
+           time_diff_back = round(time_diff_back, 3)) %>% 
+    dplyr::filter(time_diff > sfreq | time_diff_back > sfreq | is.na(time_diff) | is.na(time_diff_back)) %>% 
+    ungroup() %>% 
+    select(permutation, term, time, time_diff, time_diff_back) %>% 
+    arrange(permutation, term, time) %>% 
+    dplyr::filter(time_diff_back == sfreq | time_diff == sfreq) %>% 
+    mutate(is_solo_point = ifelse(is.na(time_diff) & time_diff_back > sfreq, T, F)) %>% 
+    group_by(permutation, term, is_solo_point) %>% 
+    mutate(index_parity = if_else(row_number() %% 2 == 1, "start", "end")) %>% 
+    mutate(time_period = round(row_number()+1/2) / 2) %>% 
+    ungroup() %>% 
+    select(-time_diff, -time_diff_back) %>% 
+    pivot_wider(names_from=c("index_parity"),
+                values_from = "time") %>% 
+    select(-time_period, -is_solo_point) %>% 
+    mutate(cluster_size = end-start) %>% 
+    dplyr::filter(!is.na(cluster_size)) %>% 
+    # check if t-values within suspected clusters have same sign (need contiguous clusters)
+    left_join(tstats.permuted %>%
+                select(permutation, time, term, t_statistic),
+              by = c("permutation", "term"),
+              multiple = "all",
+              relationship="many-to-many") %>%
+    dplyr::filter((time >= start) & (time <= end)) %>%
+    mutate(t_stat_is_positive = sign(t_statistic) == 1) %>%
+    group_by(permutation, term, start, end, cluster_size) %>%
+    # checking sign of start and end points
+    summarize(n_timepoints = n(),
+              t_stat_same_sign = mean(t_stat_is_positive),
+              t_stat_same_sign = t_stat_same_sign %in% c(0, 1)) %>%
+    ungroup() %>%
+    # select clusters where t stats at the start and end are the same (otherwise not a contiguous cluster)
+    dplyr::filter(t_stat_same_sign) %>%
+    left_join(clusters,
+              by = c("term"),
+              suffix = c(".permuted", ""),
+              multiple="all",
+              relationship="many-to-many") %>% 
+    mutate(larger_than_real_cluster = cluster_size.permuted > cluster_size) %>% 
+    group_by(permutation, term, cluster_id) %>% 
+    summarize(has_larger_cluster = max(larger_than_real_cluster)) %>% 
+    ungroup()
+}
+
+tstats.permuted.rt.clusters %>% 
+  group_by(cluster_id, term) %>% 
+  summarize(
+    n.permutations.with.clusters = n(),
+    permuted.p.value = sum(has_larger_cluster)/n_permutations) %>% 
+  kable() %>% 
+  kable_styling()
+```
+
+# Save
+
+```{r save_data, echo=T}
+save(power.betas, 
+     results.betas, 
+     power.rt.betas, 
+     results.rt.betas, 
+     tstats.permuted.clusters,
+     tstats.permuted.rt.clusters,
+     file=paste("power", power_name, "betas_include_incorrect.RData", sep="_"))
+
+
+rm(tstats.permuted.clusters)
+rm(tstats.permuted.rt.clusters)
+```

@@ -1,0 +1,2555 @@
+---
+title: "Temporal PCA on pupil data during associative retrieval"
+author: "Alice M. Xue (alicexue@stanford.edu)"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+params:
+    exp_id: "MPE"
+    run_models: yes
+output:
+  html_document:
+    toc: yes
+    toc_depth: 3
+    toc_float:
+      collapsed: no
+    self_contained: true
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+---
+
+```{r setup, include=FALSE}
+library(plyr)
+library(tidymv)
+library(Hmisc)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+library(data.table)
+library(psycho)
+library(lme4)
+library(sjPlot)
+library(afex)
+library(viridis)
+library(showtext)
+library(tidyverse)
+library(mgcv)
+library(itsadug)
+library(RColorBrewer)
+library(ggcorrplot)
+library(devtools)
+library(factoextra)
+library(tidyjson)
+library(purrr)
+library(broom)
+library(zoo)
+library(psych)
+library(patchwork)
+library(emmeans)
+library(ggpubr)
+library(stats)
+library(broom.mixed)
+library(pracma)
+library(afex)
+library(stringr)
+
+font_add(family = "Avenir Next",
+         regular = "../utils/AvenirNext-Regular.ttf",
+         bold = "../utils/AvenirNext-DemiBold.ttf",
+         italic = "../utils/AvenirNext-Italic.ttf")
+showtext.auto()
+op <- showtext_opts()
+
+fontfamily <- "Avenir Next"
+
+set_theme(
+  base=theme_classic(base_size = 12,
+                     base_family="Avenir Next")
+  
+)
+
+options(dplyr.summarise.inform = FALSE)
+
+#knitr::opts_chunk$set(dev = 'pdf') # set output device to pdf
+
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message = FALSE)
+```
+
+```{r, echo=F}
+source("../utils/summary_se_utils.R")
+```
+
+```{r get_behavior, echo=F}
+
+set.seed(478)
+
+exp_id <- params$exp_id
+
+run_models <- params$run_models
+
+data_ret <- fread("../../data/behavior/MPE_asso_retrieval_behavior.csv") %>% 
+  mutate(key = match_response.keys,
+         rt = match_response.rt * 1000)
+
+data_recog <- fread("../../data/behavior/MPE_mismatch_recog_behavior.csv") %>% 
+  mutate(rt = recognition_response.rt * 1000)
+
+recognition_behavior <- data_recog %>%
+  mutate(trialN = trials.thisTrialN) %>% 
+  select(trialN,
+         recognition_response.keys,
+         recognition_response.rt,
+         is_old,
+         img,
+         subjectId,
+         expId) %>%
+  mutate(hit = is_old & (recognition_response.keys==1)) %>%
+  mutate(false_alarm = !is_old & (recognition_response.keys==1)) %>%
+  mutate(miss = is_old & (recognition_response.keys==2)) %>%
+  mutate(correct_rejection = !is_old & (recognition_response.keys==2)) %>%
+  mutate(trial_outcome = case_when(hit ~ "Hit",
+                                   false_alarm ~ "FA",
+                                   miss ~ "Miss",
+                                   correct_rejection ~ "CR")) %>%
+  group_by(subjectId,
+           trialN,
+           trial_outcome,
+           is_old,
+           img,
+           recognition_response.keys,
+           expId) %>%
+  summarize(recognition_response.rt = mean(recognition_response.rt)) %>%
+  ungroup() 
+```
+
+```{r load_models, echo=F, eval=!run_models}
+load("tpca_models_correct_only.RData")
+```
+
+
+```{r save_or_load_data, echo=F}
+retrieval_pupil <- fread("../../data/pupil/MPE_imm_retrieval_pupil.csv") 
+
+retrieval_pupil.del <- fread("../../data/pupil/MPE_del_retrieval_pupil.csv") 
+
+retrieval_pupil <- bind_rows(retrieval_pupil, retrieval_pupil.del) %>% 
+  mutate(expId = case_when(grepl("MPE1", subjectId) ~ "imm",
+                           grepl("MPE3", subjectId) ~ "del",
+                           grepl("MPE5", subjectId) ~ "del")) %>%
+  mutate(across(expId, 
+                factor, 
+                levels=c("imm", "del"))) %>% 
+  mutate(room_setup = case_when(grepl("MPE1", subjectId) ~ "1", # eeg + pupil, shared-eeg lab
+                                grepl("MPE3", subjectId) ~ "2", # pupil only, shared-eeg lab
+                                grepl("MPE5", subjectId) ~ "3")) # pupil only, 4th floor lab
+```
+
+```{r labels, echo=F}
+
+palette <- c("#008080", "#9fdfbf")
+hit_miss_palette <- c("#6E9075", "#FC7753")
+
+ret_labels_strong <- tibble(event = c("cue", "delay", "probe", "ITI"),
+                            time = c(0, 1, 2, 2.75))
+
+ret_labels_weak <- tibble(event = c("cue", "delay", "probe", "ITI"),
+                          time = c(0, 1, 2, 2.75))
+
+ret_labels <- rbind(ret_labels_strong, ret_labels_weak)
+ret_labels$position <- 0.12
+```
+
+```{r tempPCA_trial, echo=F}
+subj_timeseries_trial <- retrieval_pupil %>% 
+  dplyr::filter(trial_outcome %in% c("Hit", "CR")) %>% 
+  mutate(pupil_diameter = pupil_diameter_z)
+
+subj_timeseries_trial %>% 
+  pivot_wider(id_cols = c("subjectId", 
+                          "expId", 
+                          "room_setup",
+                          "trial_outcome", 
+                          "match_response.rt",
+                          "association_strength", 
+                          "trialN", 
+                          "img"),
+              names_from = c("time"), 
+              values_from = c("pupil_diameter")) %>% 
+  mutate(across(trial_outcome, 
+                factor, 
+                levels=c("Hit", "CR", "Miss", "FA"))) %>% 
+  group_by(trial_outcome, association_strength) %>% 
+  summarize(count = n()) %>% 
+  ungroup() %>% 
+  mutate(total_ntrials = sum(count)) %>% 
+  mutate(percent_data = round(count / total_ntrials * 100, 2)) %>% 
+  kable() %>% 
+  kable_styling(bootstrap_options = "striped", 
+                full_width = F, 
+                position = "left")
+
+subj.data <- subj_timeseries_trial %>% 
+  pivot_wider(id_cols = c("trial_outcome",
+                          "association_strength", 
+                          "subjectId",
+                          "expId",
+                          "room_setup",
+                          "trialN",
+                          "img",
+                          "trialN_block", 
+                          "match_response.rt",
+                          "block"),
+              names_from = c("time"), 
+              values_from = c("pupil_diameter"))
+
+pca_input <- subj.data %>% 
+  select(-trial_outcome, 
+         -association_strength, 
+         -subjectId, 
+         -expId,
+         -room_setup,
+         -match_response.rt,
+         -trialN, 
+         -img, 
+         -trialN_block, 
+         -block) 
+
+ncomp <- 6
+pc_names <- paste("PC", 1:ncomp, sep = "")
+data.pca        <- prcomp(pca_input, center=T, scale=T)
+
+# scree plot
+plot(data.pca)
+
+# change the sign of PC4 columns to flip the sign of the loadings
+rot <- data.pca$rotation
+rot[, c(4)] <- rot[, c(4)] * -1
+data.pca$rotation <- rot
+
+raw.loadings     <- data.pca$rotation[,1:ncomp] %*% diag(data.pca$sdev, ncomp, ncomp)
+rotated.loadings <- varimax(raw.loadings)$loadings
+inv.loadings     <- t(pracma::pinv(rotated.loadings))
+loadings         <- rotated.loadings
+scores           <- scale(pca_input) %*% inv.loadings
+subj.pred        <- as_tibble(scores) %>% 
+  rename_with(~ gsub("V", "PC", .))
+
+fviz_eig(data.pca, addlabels = TRUE)
+
+pca.loadings <- as_tibble(matrix(as.numeric(loadings), 
+                                 attributes(loadings)$dim, 
+                                 dimnames=attributes(loadings)$dimnames), 
+                          rownames="time") %>% 
+  mutate(time = as.numeric(time)) 
+
+pca.loadings <- pca.loadings %>% 
+  rename_with(~ gsub("V", "PC", .))
+
+ss_loadings <- colSums(loadings^2)
+
+var_explained <- as_tibble(ss_loadings/nrow(loadings)) %>% 
+  mutate(percent_var_explained = value * 100) %>% 
+  add_column(component = pc_names)
+
+var_explained <- var_explained %>% 
+  arrange(desc(percent_var_explained)) %>% 
+  mutate(component_renamed = paste("PC", row_number(), sep=""))
+
+pca.loadings <- pca.loadings %>% 
+  pivot_longer(cols = pc_names, 
+               names_to = "component",
+               values_to = "loading") %>% 
+  left_join(var_explained, by=c("component")) %>% 
+  rename(component_orig = component,
+         component = component_renamed)
+
+# ordered by "peak time"
+ordered_pcs <- c("PC2",
+                 "PC5",
+                 "PC1",
+                 "PC6",
+                 "PC3",
+                 "PC4")
+
+
+component_order_with_var_explained <- c("PC2: 25.89%",
+                                        "PC5: 5.66%",
+                                        "PC1: 28.81%",
+                                        "PC6: 1.83%",
+                                        "PC3: 19.29%",
+                                        "PC4: 14.68%")
+
+```
+
+```{r plot_pc_loadings, echo=F}
+
+rainbow <- c("#E82C42", 
+             "#F46D43", 
+             "#FFCC00", 
+             "#29A343", 
+             "#1E8DD2", 
+             "#59169C")
+
+pca.loadings %>% 
+  mutate(component = paste(component, ": ", round(percent_var_explained, 2),
+                           "%",
+                           sep = "")) %>% 
+  mutate(across(component,
+                factor,
+                levels=component_order_with_var_explained)) %>%
+  ggplot(aes(x = time, 
+             y = loading,
+             color = component,
+             fill = component)) +
+  geom_vline(xintercept = c(0, 1, 2, 2.75),
+             linetype = "dashed",
+             color = "gray37") +
+  geom_line(linewidth=1.2) +
+  geom_text(aes(label = event,
+                x = time,
+                y = 0.9),
+            data = ret_labels,
+            inherit.aes = FALSE,
+            angle = 90, 
+            hjust = 1,
+            vjust = 1.2,
+            size = 6,
+            colour = "gray37",
+            family = fontfamily) + 
+  labs(x = "Time (s)",
+       y = "PC loading",
+       title = "Components extracted by temporal PCA") +
+  scale_color_manual(values=rainbow, name="") +
+  theme(text = element_text(size=15))
+
+pca.loadings %>% 
+  mutate(component = paste(component, ": ", round(percent_var_explained, 2),
+                           "%",
+                           sep = "")) %>% 
+  ggplot(aes(x = time, 
+             y = loading,
+             color = component,
+             fill = component)) +
+  geom_vline(xintercept = c(0, 1, 2, 2.75),
+             linetype = "dashed",
+             color = "gray37") +
+  geom_line(color="black", linewidth=1) +
+  geom_text(aes(label = event,
+                x = time,
+                y = 0.75),
+            data = ret_labels,
+            inherit.aes = FALSE,
+            angle = 90, 
+            hjust = 1,
+            vjust = 1.2,
+            size = 3,
+            colour = "gray37",
+            family = fontfamily) + 
+  facet_wrap(~component) +
+  labs(x = "Time (s)",
+       y = "PC loading",
+       title = "Temporal PCA") +
+  scale_color_brewer(palette="Set2") + 
+  theme(legend.position = "none")
+
+subj.data.scores <- subj.data %>% 
+  add_column(subj.pred) %>% 
+  pivot_longer(cols = pc_names, 
+               names_to = "component",
+               values_to = "component_score") %>% 
+  left_join(var_explained, by=c("component")) %>% 
+  rename(component_orig = component,
+         component = component_renamed)
+
+scores <- subj.data.scores %>% 
+  select(subjectId, 
+         trialN, 
+         img,
+         trialN_block,
+         block,
+         trial_outcome, 
+         association_strength,
+         component,
+         component_score)
+
+save(loadings,
+     inv.loadings,
+     subj.data.scores,
+     file="pupil_tPCA_correct_only.RData")
+write.csv(scores, "pupil_tPCA_scores_correct_trials_only.csv")
+write.csv(pca.loadings, "pupil_tPCA_loadings_correct_trials_only.csv")
+
+```
+
+```{r loadings_plts, echo=F}
+loadings.plt <- pca.loadings %>% 
+  mutate(component = paste(component, ": ", round(percent_var_explained, 2),
+                           "%",
+                           sep = "")) %>% 
+  ggplot(aes(x = time, 
+             y = loading,
+             color = component,
+             fill = component)) +
+  geom_vline(xintercept = c(0, 1, 2, 2.75),
+             linetype = "dashed",
+             color = "gray37") +
+  geom_line(color="black", linewidth=1) +
+  geom_text(aes(label = event,
+                x = time,
+                y = 0.75),
+            data = ret_labels,
+            inherit.aes = FALSE,
+            angle = 90, 
+            hjust = 1,
+            vjust = 1,
+            size = 3,
+            colour = "gray37",
+            family = fontfamily) + 
+  facet_wrap(~component, ncol=1) +
+  labs(x = "Time (s)",
+       y = "PC loading") +
+  theme(legend.position = "none")
+
+loadings.vrt.plt <- pca.loadings %>% 
+  mutate(component = paste(component, ": ", round(percent_var_explained, 2),
+                           "%",
+                           sep = "")) %>% 
+  mutate(across(component,
+                factor,
+                levels=component_order_with_var_explained)) %>%
+  ggplot(aes(x = time, 
+             y = loading,
+             color = component,
+             fill = component)) +
+  geom_vline(xintercept = c(0, 1, 2, 2.75),
+             linetype = "dashed",
+             color = "gray37") +
+  geom_line(color="black", linewidth=1) +
+  geom_text(aes(label = event,
+                x = time,
+                y = 0.75),
+            data = ret_labels,
+            inherit.aes = FALSE,
+            angle = 90, 
+            hjust = 1,
+            vjust = 1.2,
+            size = 3,
+            colour = "gray37",
+            family = fontfamily) + 
+  facet_wrap(~component, ncol=1) +
+  labs(x = "Time (s)",
+       y = "PC loading") +
+  theme(legend.position = "none")
+```
+
+## Memory outcome models
+
+Match v. mismatch, correct v. incorrect 
+
+```{r match_mismatch_acc_models, echo=F, eval=run_models, fig.width=6.5, fig.height=3, results="asis"}
+
+models <- c()
+models.compact.no.mismatch <- c()
+
+for (i in 1:ncomp) {
+  mod.data <- subj.data.scores %>% 
+    dplyr::filter(component == paste("PC", i, sep="")) %>% 
+    mutate(is_mismatch = if_else(trial_outcome %in% c("Hit", "Miss"),
+                                 0,
+                                 1)) %>%
+    mutate(is_incorrect = if_else(trial_outcome %in% c("Hit", "CR"),
+                                  0,
+                                  1))
+  
+  mod <- mod.data %>% 
+    lmer(component_score ~ is_mismatch * association_strength + 
+           (is_mismatch * association_strength | subjectId) + 
+           (1 | expId),
+         data = .)
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>% 
+      lmer(component_score ~ is_mismatch * association_strength + 
+             (is_mismatch * association_strength | subjectId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>% 
+      lmer(component_score ~ is_mismatch * association_strength + 
+             (is_mismatch + association_strength | subjectId) + 
+             (1 | expId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>% 
+      lmer(component_score ~ is_mismatch * association_strength + 
+             (is_mismatch + association_strength | subjectId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>% 
+      lmer(component_score ~ is_mismatch * association_strength + 
+             (1 | subjectId) + 
+             (1 | expId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>% 
+      lmer(component_score ~ is_mismatch * association_strength + 
+             (1 | subjectId),
+           data = .)
+  }
+  
+  final.mod.formula <- formula(mod) [3]
+  final.mod.formula <- paste("component_score ~", final.mod.formula)
+  no.mismatch.formula <- gsub("is_mismatch \\* ", "", final.mod.formula)
+  no.mismatch.formula <- gsub("is_mismatch \\+ ", "", no.mismatch.formula)
+  
+  mod.no.mismatch <- mod.data %>% 
+    lmer(as.formula(no.mismatch.formula),
+         data = .)
+  
+  if (isSingular(mod.no.mismatch) | any(grepl("failed to converge", mod.no.mismatch@optinfo$conv$lme4$messages))) {
+    mod.no.mismatch <- mod.data %>% 
+      lmer(component_score ~ association_strength + 
+             (association_strength | subjectId),
+           data = .)
+  }
+  
+  if (isSingular(mod.no.mismatch) | any(grepl("failed to converge", mod.no.mismatch@optinfo$conv$lme4$messages))) {
+    mod.no.mismatch <- mod.data %>% 
+      lmer(component_score ~ association_strength + 
+             (1 | subjectId),
+           data = .)
+  }
+  
+  models <- c(models, mod)
+  models.compact.no.mismatch <- c(models.compact.no.mismatch, mod.no.mismatch)
+  
+}
+
+```
+
+```{r show_match_mismatch_acc_models, echo=F, eval=T, fig.width=6.5, fig.height=3, results="asis"}
+
+for (i in 1:ncomp) {
+  
+  fig1 <- pca.loadings %>% 
+    dplyr::filter(component == paste("PC", i, sep="")) %>% 
+    mutate(component = paste(component, ": ", round(percent_var_explained, 2),
+                             "%",
+                             sep = "")) %>% 
+    ggplot(aes(x = time, 
+               y = loading,
+               color = component,
+               fill = component)) +
+    geom_vline(xintercept = c(0, 1, 2, 2.75),
+               linetype = "dashed",
+               color = "gray37") +
+    geom_line(color="black", linewidth=1) +
+    geom_text(aes(label = event,
+                  x = time,
+                  y = 0.75),
+              data = ret_labels,
+              inherit.aes = FALSE,
+              angle = 90, 
+              hjust = 1,
+              vjust = 1.2,
+              size = 3,
+              colour = "gray37",
+              family = fontfamily) + 
+    facet_wrap(~component) +
+    labs(x = "Time (s)",
+         y = "PC loading") +
+    scale_color_brewer(palette="Set2") + 
+    scale_fill_brewer(palette="Set2") +
+    theme(legend.position = "none")
+  
+  
+  fig2 <- subj.data.scores %>% 
+    dplyr::filter(component == paste("PC", i, sep="")) %>% 
+    group_by(subjectId, association_strength, trial_outcome, component) %>% 
+    summarize(component_score = mean(component_score)) %>% 
+    summarySEwithin(., 
+                    measurevar="component_score", 
+                    withinvars=c("association_strength",
+                                 "trial_outcome",
+                                 "component"), 
+                    idvar="subjectId") %>% 
+    mutate(across(trial_outcome, 
+                  factor, 
+                  levels=c("Hit", "CR", "Miss", "FA"))) %>%
+    ggplot(aes(x = association_strength,
+               y = component_score,
+               fill = trial_outcome)) +
+    stat_summary(fun = "mean", 
+                 geom = "bar", 
+                 color = "black", 
+                 position=position_dodge()) +
+    geom_errorbar(aes(ymin=component_score-se, ymax=component_score+se),
+                  position=position_dodge(.9), 
+                  width=.2) +
+    facet_wrap(~component, scales = "free") +
+    scale_color_manual(values=c("#1a75ff", "#ff751a", "#80b3ff", "#ffb380"), name="") +
+    scale_fill_manual(values=c("#1a75ff", "#ff751a", "#80b3ff", "#ffb380"), name="") +
+    labs(x = "", y = "PC score")
+  
+  print(fig1 + fig2)
+  
+  mod <- models[[i]]
+  mod.no.mismatch <- models.compact.no.mismatch[[i]]
+  title <- formula(mod) [3]
+  title <- gsub("is_mismatch", "Mismatch", title)
+  title <- gsub("is_incorrect", "Accuracy", title)
+  title <- gsub("association_strength", "Strength", title)
+  title <- gsub(":", " x ", title)
+  tidy(mod, effects = "fixed", conf.int = T, conf.level = 0.95) %>% 
+    mutate(CI = paste0("[", 
+                       sprintf("%.03f", conf.low), 
+                       ", ", 
+                       sprintf("%.03f", conf.high), 
+                       "]", 
+                       sep="")) %>% 
+    select(term, estimate, CI, p.value, std.error, df) %>% 
+    rename("Estimate" = estimate,
+           "p-value" = p.value,
+           "SE" = std.error,
+           "DF" = df
+    ) %>% 
+    mutate(term = gsub("is_mismatch", "Mismatch", term),
+           term = gsub("is_incorrect", "Accuracy", term),
+           term = gsub("association_strengthWeak \\(1x\\)", "Strength", term),
+           term = gsub(":", " x ", term)) %>% 
+    kable(caption=paste("PC", i, " score ~ ", title, sep=""),
+          digits=3) %>% 
+    kable_styling() %>% 
+    cat()
+  
+  tidy(mod, effects = "ran_pars", scales = "vcov") %>% 
+    select(term, estimate) %>% 
+    mutate(term = gsub("var__", "Variance ", term),
+           term = gsub("cov__", "Covariance ", term),
+           term = gsub("\\(Intercept\\)", "intercept", term),
+           term = gsub("is_mismatch", "Mismatch", term),
+           term = gsub("is_incorrect", "Accuracy", term),
+           term = gsub("association_strengthWeak \\(1x\\)", "Strength", term),
+           term = gsub("\\.", ", ", term)) %>% 
+    kable(digits=3, caption="Random effects") %>% 
+    kable_styling() %>% 
+    cat()
+  
+  anova(mod.no.mismatch, mod, test="LRT") %>% 
+    tidy() %>% 
+    kable(caption=paste("mod.no.mismatch:", 
+                        formula(mod.no.mismatch) [3])) %>% 
+    kable_styling() %>% 
+    cat()
+  
+  print(paste("No mismatch compact model failed to converge: ",
+              isSingular(mod.no.mismatch) | any(grepl("failed to converge", mod.no.mismatch@optinfo$conv$lme4$messages))))
+  
+  emm <- emmeans(mod, ~ is_mismatch | association_strength, adjust="bonferroni")
+  emm.pairs <- pairs(emm)
+  tidy(emm.pairs, effects = "fixed", conf.int = T, conf.level = 0.95) %>% 
+    select(association_strength, contrast, estimate, conf.low, conf.high, p.value, std.error) %>% 
+    kable(digits=3, caption=paste("PC", i, "; Pairwise comparisons", sep="")) %>% 
+    kable_styling() %>% 
+    cat()
+  
+}
+
+```
+
+```{r full_model_all_pc, echo=F, eval=F}
+
+mod <- subj.data.scores %>% 
+  mutate(is_mismatch = if_else(trial_outcome %in% c("Hit", "Miss"),
+                               0,
+                               1)) %>%
+  mutate(is_incorrect = if_else(trial_outcome %in% c("Hit", "CR"),
+                                0,
+                                1)) %>%
+  lmer(component_score ~ component * is_mismatch * association_strength + 
+         (component + is_mismatch + association_strength | subjectId),
+       data = .) 
+
+
+mod %>% 
+  summary()
+
+tidy(mod, effects = "fixed", conf.int = T, conf.level = 0.95) %>% 
+  select(term, estimate, conf.low, conf.high, p.value, std.error, df) %>% 
+  kable(digits=3) %>% 
+  kable_styling()
+
+tidy(mod, effects = "ran_pars", scales = "vcov") %>% 
+  select(term, estimate) %>% 
+  kable(digits=3, caption="Random effects") %>% 
+  kable_styling()
+
+```
+
+
+## RT models
+
+```{r get_rt_data_obj, echo=F}
+### joint plot
+rt_data <- subj.data.scores %>% 
+  mutate_at(c('trial_outcome'), as.character) %>% 
+  mutate(trial_outcome=replace(trial_outcome, trial_outcome=="Hit", "Match")) %>%
+  mutate(trial_outcome=replace(trial_outcome, trial_outcome=="CR", "Mismatch")) %>%
+  dplyr::filter(trial_outcome %in% c("Match", "Mismatch"))
+```
+
+```{r match_mismatch_rt, echo=F, eval=run_models, fig.width=7, fig.height=10}
+models.rt <- c()
+
+for (pc in 1:ncomp) {
+  mod <- rt_data %>% 
+    dplyr::filter(component == paste("PC", pc, sep="")) %>% 
+    mutate(match_response.rt = log(match_response.rt)) %>%  
+    lmer(match_response.rt ~ component_score * association_strength * trial_outcome +
+           (component_score * association_strength * trial_outcome | subjectId) + 
+           (1 | expId),
+         data = .)
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- rt_data %>% 
+      dplyr::filter(component == paste("PC", pc, sep="")) %>% 
+      mutate(match_response.rt = log(match_response.rt)) %>%  
+      lmer(match_response.rt ~ component_score * association_strength * trial_outcome +
+             (component_score * trial_outcome * association_strength | subjectId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- rt_data %>% 
+      dplyr::filter(component == paste("PC", pc, sep="")) %>% 
+      mutate(match_response.rt = log(match_response.rt)) %>%  
+      lmer(match_response.rt ~ component_score * association_strength * trial_outcome +
+             (component_score + trial_outcome + association_strength | subjectId) + 
+             (1 | expId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- rt_data %>% 
+      dplyr::filter(component == paste("PC", pc, sep="")) %>% 
+      mutate(match_response.rt = log(match_response.rt)) %>%  
+      lmer(match_response.rt ~ component_score * association_strength * trial_outcome +
+             (component_score + trial_outcome + association_strength | subjectId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- rt_data %>% 
+      dplyr::filter(component == paste("PC", pc, sep="")) %>% 
+      mutate(match_response.rt = log(match_response.rt)) %>%  
+      lmer(match_response.rt ~ component_score * association_strength * trial_outcome +
+             (component_score | subjectId) + 
+             (1 | expId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- rt_data %>% 
+      dplyr::filter(component == paste("PC", pc, sep="")) %>% 
+      mutate(match_response.rt = log(match_response.rt)) %>%  
+      lmer(match_response.rt ~ component_score * association_strength * trial_outcome +
+             (1 | subjectId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    print(paste("MODEL DID NOT CONVERGE FOR PC", pc))
+  }
+  
+  models.rt <- c(models.rt, mod)
+  
+}
+```
+
+
+```{r binned_rt, echo=F, fig.width=7, fig.height=10}
+
+nbins <- 4
+
+rt.binned.plt <- rt_data %>% 
+  group_by(subjectId, component, association_strength, trial_outcome) %>%
+  mutate(trial_count = n()) %>%
+  ungroup() %>%
+  dplyr::filter(trial_count > nbins-1) %>%
+  group_by(subjectId, component, association_strength, trial_outcome) %>% 
+  mutate(component_score_bin = cut_interval(component_score, 
+                                            n = nbins,
+                                            labels = F)) %>% 
+  ungroup() %>% 
+  group_by(subjectId, trial_outcome, association_strength,
+           component, component_score_bin) %>% 
+  summarize(rt = median(match_response.rt)) %>% 
+  summarySEwithin(., 
+                  measurevar="rt", 
+                  withinvars=c("association_strength",
+                               "trial_outcome",
+                               "component",
+                               "component_score_bin"), 
+                  idvar="subjectId") %>% 
+  # mutate(across(component,
+  #               factor,
+  #               levels=ordered_pcs)) %>% 
+  ggplot(aes(x = as.numeric(as.character(component_score_bin)),
+             y = rt,
+             color = trial_outcome,
+             group = trial_outcome)) +
+  geom_line(linewidth=0.8) +
+  geom_point(size=1.5) +
+  geom_errorbar(aes(ymin=rt-se, ymax=rt+se),
+                width=0.2) +
+  facet_grid(rows=vars(component), 
+             cols=vars(association_strength),
+             axes="all_x",
+             scales = "free") +
+  scale_color_manual(values=c("#1a75ff", "#ff751a"), name="") +
+  scale_fill_manual(values=c("#1a75ff", "#ff751a"), name="") +
+  labs(x = "PC score quartile", y = "RT (s)") +
+  theme(strip.text.y = element_blank())
+
+loadings.plt + rt.binned.plt +
+  plot_layout(widths=c(1,2))
+
+```
+
+```{r show_mismatch_rt_models, echo=F, fig.width=6.5, fig.height=3, results="asis"}
+for (pc in 1:ncomp) {
+  fig1 <- pca.loadings %>% 
+    dplyr::filter(component == paste("PC", pc, sep="")) %>% 
+    mutate(component = paste(component, ": ", round(percent_var_explained, 2),
+                             "%",
+                             sep = "")) %>% 
+    ggplot(aes(x = time, 
+               y = loading,
+               color = component,
+               fill = component)) +
+    geom_vline(xintercept = c(0, 1, 2, 2.75),
+               linetype = "dashed",
+               color = "gray37") +
+    geom_line(color="black", linewidth=1) +
+    geom_text(aes(label = event,
+                  x = time,
+                  y = 0.75),
+              data = ret_labels,
+              inherit.aes = FALSE,
+              angle = 90, 
+              hjust = 1,
+              vjust = 1.2,
+              size = 3,
+              colour = "gray37",
+              family = fontfamily) + 
+    facet_wrap(~component) +
+    labs(x = "Time (s)",
+         y = "PC loading") +
+    scale_color_brewer(palette="Set2") + 
+    scale_fill_brewer(palette="Set2") +
+    theme(legend.position = "none")
+  
+  mod <- models.rt[[pc]]
+  fig2 <- mod %>% 
+    plot_model(type="pred",
+               terms=c("component_score[all]",
+                       "trial_outcome[all]",
+                       "association_strength[Strong (4x), Weak (1x)]")) +
+    scale_color_manual(values=c("#1a75ff", "#ff751a"), name="") +
+    scale_fill_manual(values=c("#1a75ff", "#ff751a"), name="") +
+    labs(y = "RT (s)") + 
+    theme(plot.title=element_blank(),
+          axis.title.x=element_blank())
+  
+  print(fig1 + fig2)
+  
+  title <- formula(mod)[3]
+  title <- gsub("trial_outcome", "Mismatch", title)
+  title <- gsub("component_score", 
+                paste("PC", pc, " score", sep=""), 
+                title)
+  title <- gsub("association_strength", "Strength", title)
+  title <- gsub(":", " x ", title)
+  tidy(mod, effects = "fixed", conf.int = T, conf.level = 0.95) %>% 
+    mutate(CI = paste0("[", 
+                       sprintf("%.03f", conf.low), 
+                       ", ", 
+                       sprintf("%.03f", conf.high), 
+                       "]", 
+                       sep="")) %>% 
+    select(term, estimate, CI, p.value, std.error, df) %>% 
+    rename("Estimate" = estimate,
+           "p-value" = p.value,
+           "SE" = std.error,
+           "DF" = df
+    ) %>% 
+    mutate(term = gsub("trial_outcomeMismatch", "Mismatch", term),
+           term = gsub("component_score", 
+                       paste("PC", pc, " score", sep=""), 
+                       term),
+           term = gsub("association_strengthWeak \\(1x\\)", "Strength", term),
+           term = gsub(":", " x ", term)) %>% 
+    kable(caption=paste("RT ~ ", title, sep=""),
+          digits=3) %>% 
+    kable_styling() %>% 
+    cat()
+  
+  tidy(mod, effects = "ran_pars", scales = "vcov") %>% 
+    select(term, estimate) %>% 
+    mutate(term = gsub("var__", "Variance ", term),
+           term = gsub("cov__", "Covariance ", term),
+           term = gsub("\\(Intercept\\)", "intercept", term),
+           term = gsub("is_mismatch", "Mismatch", term),
+           term = gsub("is_incorrect", "Accuracy", term),
+           term = gsub("association_strengthWeak \\(1x\\)", "Strength", term),
+           term = gsub("\\.", ", ", term)) %>% 
+    kable(digits=3, caption="Random effects") %>% 
+    kable_styling() %>% 
+    cat()
+  
+  slopes <- emtrends(mod, pairwise ~ association_strength * trial_outcome, var = "component_score")
+  
+  print("Degrees-of-freedom method: asymptotic P value adjustment: tukey method for comparing a family of 4 estimates")
+  
+  tidy(slopes$emtrends, conf.int = T, conf.level = 0.95) %>% 
+    kable(caption=paste("slopes: RT ~ ", title, sep=""),
+          digits=3) %>% 
+    kable_styling() %>% 
+    cat()
+  
+  tidy(slopes$contrasts, conf.int = T, conf.level = 0.95) %>% 
+    select(contrast, estimate, std.error, df, conf.low, conf.high, statistic, adj.p.value) %>% 
+    kable(caption=paste("slope contrasts: RT ~ ", title, sep=""),
+          digits=3) %>% 
+    kable_styling() %>% 
+    cat()
+  
+}
+```
+
+
+## Individual PC plots
+
+```{r indivi_pc_plots, fig.width=6, fig.height=2, echo=F}
+
+showtext_opts(dpi = 300)
+for (pc in 1:ncomp) {
+  fig1 <- pca.loadings %>% 
+    dplyr::filter(component == paste("PC", pc, sep="")) %>% 
+    mutate(component = paste(component, ": ", round(percent_var_explained, 2),
+                             "%",
+                             sep = "")) %>% 
+    ggplot(aes(x = time, 
+               y = loading,
+               color = component,
+               fill = component)) +
+    geom_vline(xintercept = c(0, 1, 2, 2.75),
+               linetype = "dashed",
+               color = "gray37") +
+    geom_line(color="black", linewidth=1) +
+    geom_text(aes(label = event,
+                  x = time,
+                  y = 0.75),
+              data = ret_labels,
+              inherit.aes = FALSE,
+              angle = 90, 
+              hjust = 1,
+              vjust = 1.2,
+              size = 3,
+              colour = "gray37",
+              family = fontfamily) + 
+    facet_wrap(~component) +
+    ylim(-0.25, 1) +
+    labs(x = "Time (s)",
+         y = "PC loading") +
+    scale_color_brewer(palette="Set2") + 
+    scale_fill_brewer(palette="Set2") +
+    theme(legend.position = "none")
+  
+  fig2 <- subj.data.scores %>% 
+    dplyr::filter(component == paste("PC", pc, sep="")) %>% 
+    mutate(trial_outcome = ifelse(as.character(trial_outcome) %in% c("Hit"), 
+                                  "Match", "Mismatch")) %>% 
+    group_by(subjectId, association_strength, trial_outcome, component) %>% 
+    summarize(component_score = mean(component_score)) %>% 
+    summarySEwithin(., 
+                    measurevar="component_score", 
+                    withinvars=c("association_strength",
+                                 "trial_outcome",
+                                 "component"), 
+                    idvar="subjectId") %>% 
+    ggplot(aes(x = exp_id,
+               y = component_score,
+               fill = trial_outcome)) +
+    stat_summary(fun = "mean", 
+                 geom = "bar", 
+                 color = "black", 
+                 position=position_dodge()) +
+    geom_errorbar(aes(ymin=component_score-se, ymax=component_score+se),
+                  position=position_dodge(.9), 
+                  width=.2) +
+    facet_grid(cols=vars(association_strength), 
+               rows=vars(component)) +
+    scale_color_manual(values=c("#1a75ff", "#ff751a"), name="") +
+    scale_fill_manual(values=c("#1a75ff", "#ff751a"), name="") +
+    labs(x = "", y = "PC score") + 
+    theme(axis.title.x=element_blank(),
+          axis.text.x=element_blank(),
+          axis.ticks.x=element_blank())
+  
+  fig3 <- rt_data %>% 
+    dplyr::filter(component == paste("PC", pc, sep="")) %>% 
+    group_by(subjectId, component, association_strength, trial_outcome) %>%
+    # exclude any subjects with # trials < # bins
+    mutate(trial_count = n()) %>%
+    ungroup() %>%
+    dplyr::filter(trial_count > nbins-1) %>%
+    group_by(subjectId, component, association_strength, trial_outcome) %>% 
+    mutate(component_score_bin = cut_interval(component_score, 
+                                              n = nbins,
+                                              labels = F)) %>% 
+    ungroup() %>% 
+    group_by(subjectId, trial_outcome, association_strength,
+             component, component_score_bin) %>% 
+    summarize(rt = median(match_response.rt)) %>% 
+    summarySEwithin(., 
+                    measurevar="rt", 
+                    withinvars=c("association_strength",
+                                 "trial_outcome",
+                                 "component",
+                                 "component_score_bin"), 
+                    idvar="subjectId") %>% 
+    mutate(across(component,
+                  factor,
+                  levels=ordered_pcs)) %>%
+    ggplot(aes(x = as.numeric(as.character(component_score_bin)),
+               y = rt,
+               color = trial_outcome,
+               group = trial_outcome)) +
+    geom_line(linewidth=0.8) +
+    geom_point(size=1.5) +
+    geom_errorbar(aes(ymin=rt-se, ymax=rt+se),
+                  width=0.2) +
+    facet_grid(cols=vars(association_strength), 
+               rows=vars(component)) +
+    scale_color_manual(values=c("#1a75ff", "#ff751a"), name="") +
+    scale_fill_manual(values=c("#1a75ff", "#ff751a"), name="") +
+    labs(x = "PC score quartile", y = "RT (s)") +
+    guides(color = "none")
+  
+  joint.fig <- (fig1 + fig2 + fig3) +
+    plot_layout(widths=c(1,1,1), 
+                guides="collect", axis_titles = "collect") &
+    theme(strip.text.x = element_text(size=12),
+          strip.text.y = element_blank(),
+          strip.background = element_blank(),
+          text = element_text(size = 10),
+    )
+  
+  ggsave(paste("tPCA_figures_correct_only/PC", pc, "_scores_and_RT.pdf", sep=""),
+         plot=joint.fig,
+         width=22, 
+         height=7, 
+         dpi=300,
+         create.dir=T,
+         units="cm")
+}
+
+showtext_opts(op)
+```
+
+
+```{r other_version_of_pc_plots, fig.width=6, fig.height=2, echo=F}
+
+showtext_opts(dpi = 300)
+for (pc in 1:ncomp) {
+  fig1 <- pca.loadings %>% 
+    dplyr::filter(component == paste("PC", pc, sep="")) %>% 
+    ggplot(aes(x = time, 
+               y = loading,
+               color = component,
+               fill = component)) +
+    geom_vline(xintercept = c(0, 1, 2, 2.75),
+               linetype = "dashed",
+               color = "gray37") +
+    geom_line(color="black", linewidth=1) +
+    geom_text(aes(label = event,
+                  x = time,
+                  y = 0.75),
+              data = ret_labels,
+              inherit.aes = FALSE,
+              angle = 90, 
+              hjust = 1,
+              vjust = 1.2,
+              size = 3,
+              colour = "gray37",
+              family = fontfamily) + 
+    facet_wrap(~component) +
+    ylim(-0.25, 1) +
+    labs(x = "Time (s)",
+         y = "PC loading") +
+    scale_color_brewer(palette="Set2") + 
+    scale_fill_brewer(palette="Set2") +
+    theme(legend.position = "none",
+          strip.text.x = element_text(size=12),
+          strip.background = element_blank())
+  
+  fig2 <- subj.data.scores %>% 
+    dplyr::filter(component == paste("PC", pc, sep="")) %>% 
+    mutate(trial_outcome = ifelse(as.character(trial_outcome) %in% c("Hit"), 
+                                  "Match", "Mismatch")) %>% 
+    group_by(subjectId, association_strength, trial_outcome, component) %>% 
+    summarize(component_score = mean(component_score)) %>% 
+    summarySEwithin(., 
+                    measurevar="component_score", 
+                    withinvars=c("association_strength",
+                                 "trial_outcome",
+                                 "component"), 
+                    idvar="subjectId") %>% 
+    ggplot(aes(x = exp_id,
+               y = component_score,
+               fill = trial_outcome)) +
+    stat_summary(fun = "mean", 
+                 geom = "bar", 
+                 color = "black", 
+                 position=position_dodge()) +
+    geom_errorbar(aes(ymin=component_score-se, ymax=component_score+se),
+                  position=position_dodge(.9), 
+                  width=.2) +
+    facet_grid(cols=vars(association_strength), 
+               rows=vars(component)) +
+    scale_color_manual(values=c("#1a75ff", "#ff751a"), name="") +
+    scale_fill_manual(values=c("#1a75ff", "#ff751a"), name="") +
+    labs(x = "", y = "PC score") + 
+    theme(axis.title.x=element_blank(),
+          axis.text.x=element_blank(),
+          axis.ticks.x=element_blank())
+  
+  fig3 <- rt_data %>% 
+    dplyr::filter(component == paste("PC", pc, sep="")) %>% 
+    group_by(subjectId, component, association_strength, trial_outcome) %>%
+    # exclude any subjects with # trials < # bins
+    mutate(trial_count = n()) %>%
+    ungroup() %>%
+    dplyr::filter(trial_count > nbins-1) %>%
+    group_by(subjectId, component, association_strength, trial_outcome) %>% 
+    mutate(component_score_bin = cut_interval(component_score, 
+                                              n = nbins,
+                                              labels = F)) %>% 
+    ungroup() %>% 
+    group_by(subjectId, trial_outcome, association_strength,
+             component, component_score_bin) %>% 
+    summarize(rt = median(match_response.rt)) %>% 
+    summarySEwithin(., 
+                    measurevar="rt", 
+                    withinvars=c("association_strength",
+                                 "trial_outcome",
+                                 "component",
+                                 "component_score_bin"), 
+                    idvar="subjectId") %>% 
+    mutate(across(component,
+                  factor,
+                  levels=ordered_pcs)) %>%
+    ggplot(aes(x = as.numeric(as.character(component_score_bin)),
+               y = rt,
+               color = trial_outcome,
+               group = trial_outcome)) +
+    geom_line(linewidth=0.8) +
+    geom_point(size=1.5) +
+    geom_errorbar(aes(ymin=rt-se, ymax=rt+se),
+                  width=0.2) +
+    facet_grid(cols=vars(association_strength), 
+               rows=vars(component)) +
+    scale_color_manual(values=c("#1a75ff", "#ff751a"), name="") +
+    scale_fill_manual(values=c("#1a75ff", "#ff751a"), name="") +
+    labs(x = "PC score quartile", y = "RT (s)") +
+    guides(color = "none")
+  
+  joint.fig <- (fig1 + fig2 + fig3) +
+    plot_layout(widths=c(1,1,1), 
+                guides="collect", axis_titles = "collect") &
+    theme(strip.text.y = element_blank()
+    )
+  
+  ggsave(paste("tPCA_figures_correct_only/PC", pc, "_scores_and_RT_framed.pdf", sep=""),
+         plot=joint.fig,
+         width=23, 
+         height=7, 
+         dpi=300,
+         create.dir=T,
+         units="cm")
+}
+showtext_opts(op)
+
+```
+
+```{r rainbow_indivi_pc_plots, fig.width=2, fig.height=6, echo=F}
+
+showtext_opts(dpi = 300)
+
+full.rainbow.fig <- list()
+
+for (pc in 1:ncomp) {
+  
+  ordered.rainbow <- c("#FFCC00", "#E82C42", "#59169C", "#1E8DD2", "#F46D43", "#29A343")
+  
+  pc.color <- ordered.rainbow[[pc]]
+  
+  fig1 <- pca.loadings %>% 
+    dplyr::filter(component == paste("PC", pc, sep="")) %>% 
+    mutate(component = paste(component, ": ", round(percent_var_explained, 2),
+                             "%",
+                             sep = "")) %>% 
+    ggplot(aes(x = time, 
+               y = loading,
+               color = component,
+               fill = component)) +
+    geom_vline(xintercept = c(0, 1, 2, 2.75),
+               linetype = "dashed",
+               color = "gray37") +
+    geom_line(color=pc.color, linewidth=1) +
+    geom_text(aes(label = event,
+                  x = time,
+                  y = 0.75),
+              data = ret_labels,
+              inherit.aes = FALSE,
+              angle = 90, 
+              hjust = 1,
+              vjust = 1.2,
+              size = 3,
+              colour = "gray37",
+              family = fontfamily) + 
+    facet_wrap(~component) +
+    ylim(-0.25, 1) +
+    labs(x = "Time (s)",
+         y = "PC loading") +
+    scale_color_brewer(palette="Set2") + 
+    scale_fill_brewer(palette="Set2") +
+    theme(legend.position = "none")
+  
+  fig2 <- subj.data.scores %>% 
+    dplyr::filter(component == paste("PC", pc, sep="")) %>% 
+    mutate(trial_outcome = ifelse(trial_outcome %in% c("Hit"), 
+                                  "Match", "Mismatch")) %>% 
+    group_by(subjectId, association_strength, trial_outcome, component) %>% 
+    summarize(component_score = mean(component_score)) %>% 
+    summarySEwithin(., 
+                    measurevar="component_score", 
+                    withinvars=c("association_strength",
+                                 "trial_outcome",
+                                 "component"), 
+                    idvar="subjectId") %>% 
+    ggplot(aes(x = exp_id,
+               y = component_score,
+               fill = trial_outcome)) +
+    stat_summary(fun = "mean", 
+                 geom = "bar", 
+                 color = "black", 
+                 position=position_dodge()) +
+    geom_errorbar(aes(ymin=component_score-se, ymax=component_score+se),
+                  position=position_dodge(.9), 
+                  width=.2) +
+    facet_grid(cols=vars(association_strength), 
+               rows=vars(component)) +
+    scale_color_manual(values=c("#1a75ff", "#ff751a"), name="") +
+    scale_fill_manual(values=c("#1a75ff", "#ff751a"), name="") +
+    labs(x = "Memory outcome", y = "PC score") + 
+    theme(axis.text.x=element_blank())
+  
+  fig3 <- rt_data %>% 
+    dplyr::filter(component == paste("PC", pc, sep="")) %>% 
+    mutate(trial_outcome = ifelse(trial_outcome %in% c("Hit"), 
+                                  "Match", "Mismatch")) %>% 
+    group_by(subjectId, component, association_strength, trial_outcome) %>%
+    # exclude any subjects with # trials < # bins
+    mutate(trial_count = n()) %>%
+    ungroup() %>%
+    dplyr::filter(trial_count > nbins-1) %>%
+    group_by(subjectId, component, association_strength, trial_outcome) %>% 
+    mutate(component_score_bin = cut_interval(component_score, 
+                                              n = nbins,
+                                              labels = F)) %>% 
+    ungroup() %>% 
+    group_by(subjectId, trial_outcome, association_strength,
+             component, component_score_bin) %>% 
+    summarize(rt = median(match_response.rt)) %>% 
+    summarySEwithin(., 
+                    measurevar="rt", 
+                    withinvars=c("association_strength",
+                                 "trial_outcome",
+                                 "component",
+                                 "component_score_bin"), 
+                    idvar="subjectId") %>% 
+    mutate(across(component,
+                  factor,
+                  levels=ordered_pcs)) %>%
+    ggplot(aes(x = as.numeric(as.character(component_score_bin)),
+               y = rt,
+               color = trial_outcome,
+               group = trial_outcome)) +
+    geom_line(linewidth=0.8) +
+    geom_point(size=1.5) +
+    geom_errorbar(aes(ymin=rt-se, ymax=rt+se),
+                  width=0.2) +
+    facet_grid(cols=vars(association_strength), 
+               rows=vars(component)) +
+    scale_color_manual(values=c("#1a75ff", "#ff751a"), name="") +
+    scale_fill_manual(values=c("#1a75ff", "#ff751a"), name="") +
+    labs(x = "PC score quartile", y = "RT (s)") +
+    guides(color = "none")
+  
+  full.rainbow.fig[[pc]] <- fig1 / fig2 / fig3
+}
+
+rainbow.fig <- (full.rainbow.fig[[2]] |
+                  full.rainbow.fig[[5]] |
+                  full.rainbow.fig[[1]] | 
+                  full.rainbow.fig[[6]] | 
+                  full.rainbow.fig[[4]] | 
+                  full.rainbow.fig[[3]]) + 
+  plot_layout(
+    guides = "collect", axes = "collect", axis_titles = "collect") &
+  theme(strip.text.x = element_text(size=12),
+        strip.text.y = element_blank(),
+        strip.background = element_blank(),
+        text = element_text(size = 10),
+        legend.position = "left"
+  )
+
+ggsave(paste("tPCA_figures_correct_only/rainbow_all_PC_scores_and_RT.pdf", sep=""),
+       plot=rainbow.fig,
+       width=40, 
+       height=18, 
+       dpi=300,
+       create.dir=T,
+       units="cm")
+
+showtext_opts(op)
+
+```
+
+```{r rainbow_with_titles_indivi_pc_plots, fig.width=2, fig.height=6, echo=F}
+
+showtext_opts(dpi = 300)
+
+titles <- list("PC1"="'Memory reinstatement strength'",
+               "PC2"="'Preparatory attention'",
+               "PC3"="'Prediction error x strength'",
+               "PC4"="'Orienting response to errors'",
+               "PC5"="'Cognitive effort'",
+               "PC6"="'Mismatch detection'")
+
+full.rainbow.fig <- list()
+
+for (pc in 1:ncomp) {
+  
+  ordered.rainbow <- c("#FFCC00", "#E82C42", "#59169C", "#1E8DD2", "#F46D43", "#29A343")
+  
+  pc.color <- ordered.rainbow[[pc]]
+  
+  fig1 <- pca.loadings %>% 
+    dplyr::filter(component == paste("PC", pc, sep="")) %>% 
+    mutate(component = paste(component, ": ", round(percent_var_explained, 2),
+                             "%",
+                             sep = "")) %>% 
+    ggplot(aes(x = time, 
+               y = loading,
+               color = component,
+               fill = component)) +
+    geom_vline(xintercept = c(0, 1, 2, 2.75),
+               linetype = "dashed",
+               color = "gray37") +
+    geom_line(color=pc.color, linewidth=1) +
+    geom_text(aes(label = event,
+                  x = time,
+                  y = 0.75),
+              data = ret_labels,
+              inherit.aes = FALSE,
+              angle = 90, 
+              hjust = 1,
+              vjust = 1.2,
+              size = 3,
+              colour = "gray37",
+              family = fontfamily) + 
+    facet_wrap(~component) +
+    ylim(-0.25, 1) +
+    labs(x = "Time (s)",
+         y = "PC loading",
+         title = titles[[pc]]) +
+    theme(legend.position = "none",
+          plot.title=element_text(hjust=0),
+          plot.subtitle=element_text(size=12))
+  
+  fig2 <- subj.data.scores %>% 
+    dplyr::filter(component == paste("PC", pc, sep="")) %>% 
+    mutate(across(trial_outcome, 
+                  factor, 
+                  levels=c("Hit", "Miss", "CR", "FA"))) %>%
+    group_by(subjectId, association_strength, trial_outcome, component) %>% 
+    summarize(component_score = mean(component_score)) %>% 
+    summarySEwithin(., 
+                    measurevar="component_score", 
+                    withinvars=c("association_strength",
+                                 "trial_outcome",
+                                 "component"), 
+                    idvar="subjectId") %>% 
+    ggplot(aes(x = exp_id,
+               y = component_score,
+               fill = trial_outcome)) +
+    stat_summary(fun = "mean", 
+                 geom = "bar", 
+                 color = "black", 
+                 position=position_dodge()) +
+    geom_errorbar(aes(ymin=component_score-se, ymax=component_score+se),
+                  position=position_dodge(.9), 
+                  width=.2) +
+    facet_grid(cols=vars(association_strength), 
+               rows=vars(component)) +
+    scale_color_manual(values=c("#1a75ff", "#ff751a"), name="") +
+    scale_fill_manual(values=c("#1a75ff", "#ff751a"), name="") +
+    labs(x = "Memory outcome", y = "PC score") + 
+    theme(axis.text.x=element_blank())
+  
+  fig3 <- rt_data %>% 
+    dplyr::filter(component == paste("PC", pc, sep="")) %>% 
+    group_by(subjectId, component, association_strength, trial_outcome) %>%
+    # exclude any subjects with # trials < # bins
+    mutate(trial_count = n()) %>%
+    ungroup() %>%
+    dplyr::filter(trial_count > nbins-1) %>%
+    group_by(subjectId, component, association_strength, trial_outcome) %>% 
+    mutate(component_score_bin = cut_interval(component_score, 
+                                              n = nbins,
+                                              labels = F)) %>% 
+    ungroup() %>% 
+    group_by(subjectId, trial_outcome, association_strength,
+             component, component_score_bin) %>% 
+    summarize(rt = median(match_response.rt)) %>% 
+    summarySEwithin(., 
+                    measurevar="rt", 
+                    withinvars=c("association_strength",
+                                 "trial_outcome",
+                                 "component",
+                                 "component_score_bin"), 
+                    idvar="subjectId") %>% 
+    mutate(across(component,
+                  factor,
+                  levels=ordered_pcs)) %>%
+    ggplot(aes(x = as.numeric(as.character(component_score_bin)),
+               y = rt,
+               color = trial_outcome,
+               group = trial_outcome)) +
+    geom_line(linewidth=0.8) +
+    geom_point(size=1.5) +
+    geom_errorbar(aes(ymin=rt-se, ymax=rt+se),
+                  width=0.2) +
+    facet_grid(cols=vars(association_strength), 
+               rows=vars(component)) +
+    scale_color_manual(values=c("#1a75ff", "#ff751a"), name="") +
+    scale_fill_manual(values=c("#1a75ff", "#ff751a"), name="") +
+    labs(x = "PC score quartile", y = "RT (s)") +
+    guides(color = "none")
+  
+  full.rainbow.fig[[pc]] <- fig1 / fig2 / fig3
+}
+
+rainbow.fig <- (full.rainbow.fig[[2]] |
+                  full.rainbow.fig[[5]] |
+                  full.rainbow.fig[[1]] | 
+                  full.rainbow.fig[[6]] | 
+                  full.rainbow.fig[[3]] | 
+                  full.rainbow.fig[[4]]) + 
+  plot_layout(guides="collect",
+              tag_level = 'new') +
+  plot_annotation(tag_levels = list(c("A", "", "",
+                                      "B", "", "",
+                                      "C", "", "", 
+                                      "D", "", "",
+                                      "E", "", "",
+                                      "F", "", ""))) &
+  theme(strip.text.x = element_text(size=12),
+        strip.text.y = element_blank(),
+        strip.background = element_blank(),
+        text = element_text(size = 10),
+        plot.margin = margin(0, 10, 0, 10),
+        plot.title.position = "plot",
+        plot.subtitle=element_text(hjust=0, margin=margin(t=5)),
+        plot.tag = element_text(face="bold", margin=margin(t=5, b=5)),
+        axis.title.y = element_text(margin = margin(r=0)),
+        axis.text.y = element_text(margin = margin(l=3, r=3)))
+
+ggsave(paste("tPCA_figures_correct_only/rainbow_all_PC_scores_and_RT_titled.pdf", sep=""),
+       plot=rainbow.fig,
+       width=46, 
+       height=16, 
+       dpi=300,
+       create.dir=T,
+       units="cm")
+
+showtext_opts(op)
+
+```
+
+
+```{r custom_indivi_pc_plots, fig.width=6, fig.height=2, echo=F}
+
+indiv_pc_plots <- list()
+
+showtext_opts(dpi = 300)
+
+for (pc in 1:ncomp) {
+  fig1 <- pca.loadings %>% 
+    dplyr::filter(component == paste("PC", pc, sep="")) %>%
+    mutate(component = paste(component, ": ", round(percent_var_explained, 2),
+                             "%",
+                             sep = "")) %>% 
+    ggplot(aes(x = time, 
+               y = loading,
+               color = component,
+               fill = component)) +
+    geom_vline(xintercept = c(0, 1, 2, 2.75),
+               linetype = "dashed",
+               color = "gray37") +
+    geom_line(color="black", linewidth=1) +
+    geom_text(aes(label = event,
+                  x = time,
+                  y = 0.75),
+              data = ret_labels,
+              inherit.aes = FALSE,
+              angle = 90, 
+              hjust = 1,
+              vjust = 1.2,
+              size = 4,
+              colour = "gray37",
+              family = fontfamily) + 
+    facet_wrap(~component) +
+    ylim(-0.25, 1) +
+    labs(x = "Time (s)",
+         y = "PC loading",
+         subtitle = titles[[paste("PC", pc, sep="")]]) +
+    scale_color_brewer(palette="Set2") + 
+    scale_fill_brewer(palette="Set2") +
+    theme(legend.position = "none",
+          plot.title=element_text(hjust=-0.1),
+          plot.subtitle=element_text(size=12))
+  
+  fig2 <- subj.data.scores %>% 
+    dplyr::filter(component == paste("PC", pc, sep="")) %>% 
+    mutate(across(trial_outcome, 
+                  factor, 
+                  levels=c("Hit", "Miss", "CR", "FA"))) %>%
+    group_by(subjectId, association_strength, trial_outcome, component) %>% 
+    summarize(component_score = mean(component_score)) %>% 
+    summarySEwithin(., 
+                    measurevar="component_score", 
+                    withinvars=c("association_strength",
+                                 "trial_outcome",
+                                 "component"), 
+                    idvar="subjectId") %>% 
+    ggplot(aes(x = exp_id,
+               y = component_score,
+               fill = trial_outcome)) +
+    stat_summary(fun = "mean", 
+                 geom = "bar", 
+                 color = "black", 
+                 position=position_dodge()) +
+    geom_errorbar(aes(ymin=component_score-se, ymax=component_score+se),
+                  position=position_dodge(.9), 
+                  width=.2) +
+    facet_grid(cols=vars(association_strength), 
+               rows=vars(component)) +
+    scale_color_manual(values=c("#1a75ff", "#ff751a"), name="") +
+    scale_fill_manual(values=c("#1a75ff", "#ff751a"), name="") +
+    labs(x = "", y = "PC score") + 
+    theme(axis.title.x=element_blank(),
+          axis.text.x=element_blank(),
+          axis.ticks.x=element_blank())
+  
+  fig3 <- rt_data %>% 
+    dplyr::filter(component == paste("PC", pc, sep="")) %>% 
+    group_by(subjectId, component, association_strength, trial_outcome) %>%
+    # exclude any subjects with # trials < # bins
+    mutate(trial_count = n()) %>%
+    ungroup() %>%
+    dplyr::filter(trial_count > nbins-1) %>%
+    group_by(subjectId, component, association_strength, trial_outcome) %>% 
+    mutate(component_score_bin = cut_interval(component_score, 
+                                              n = nbins,
+                                              labels = F)) %>% 
+    ungroup() %>% 
+    group_by(subjectId, trial_outcome, association_strength,
+             component, component_score_bin) %>% 
+    summarize(rt = median(match_response.rt)) %>% 
+    summarySEwithin(., 
+                    measurevar="rt", 
+                    withinvars=c("association_strength",
+                                 "trial_outcome",
+                                 "component",
+                                 "component_score_bin"), 
+                    idvar="subjectId") %>% 
+    mutate(across(component,
+                  factor,
+                  levels=ordered_pcs)) %>%
+    ggplot(aes(x = as.numeric(as.character(component_score_bin)),
+               y = rt,
+               color = trial_outcome,
+               group = trial_outcome)) +
+    geom_line(linewidth=0.8) +
+    geom_point(size=1.5) +
+    geom_errorbar(aes(ymin=rt-se, ymax=rt+se),
+                  width=0.2) +
+    facet_grid(cols=vars(association_strength), 
+               rows=vars(component)) +
+    scale_color_manual(values=c("#1a75ff", "#ff751a"), name="") +
+    scale_fill_manual(values=c("#1a75ff", "#ff751a"), name="") +
+    labs(x = "PC score quartile", y = "RT (s)") +
+    guides(color = "none")
+  
+  joint.fig <- (fig1 + fig2 + fig3) +
+    plot_layout(widths=c(1,1,1), 
+                guides="collect", axes = "collect", axis_titles = "collect") &
+    theme(strip.text.x = element_text(size=12),
+          strip.text.y = element_blank(),
+          strip.background = element_blank(),
+          text = element_text(size = 10),
+          plot.title=element_text(hjust=0.5)
+    )
+  
+  indiv_pc_plots[[paste("PC", pc, sep="")]] <- fig1 + fig2 + fig3
+  
+  # ggsave(paste("tPCA_figures_correct_only/PC", pc, "_scores_and_RT.pdf", sep=""),
+  #        plot=joint.fig,
+  #        width=22, 
+  #        height=7, 
+  #        dpi=300,
+  #        units="cm")
+}
+
+plot.full <- (indiv_pc_plots[["PC2"]] / 
+                indiv_pc_plots[["PC5"]] / 
+                indiv_pc_plots[["PC1"]] / 
+                indiv_pc_plots[["PC6"]] / 
+                indiv_pc_plots[["PC3"]] / 
+                indiv_pc_plots[["PC4"]]) +
+  plot_layout(guides="collect",
+              tag_level = 'new') +
+  plot_annotation(tag_levels = list(c("A", "", "",
+                                      "B", "", "",
+                                      "C", "", "", 
+                                      "D", "", "",
+                                      "E", "", "",
+                                      "F", "", ""))) &
+  theme(strip.text.x = element_text(size=12),
+        strip.text.y = element_blank(),
+        strip.background = element_blank(),
+        text = element_text(size = 10),
+        plot.margin = margin(0, 0, 0, 5),
+        plot.title.position = "plot",
+        plot.subtitle=element_text(hjust=0, margin=margin(t=5)),
+        plot.tag = element_text(face="bold", margin=margin(t=0)),
+        axis.title.y = element_text(margin = margin(r=0)),
+        axis.text.y = element_text(margin = margin(l=3, r=3)))
+
+ggsave(paste("tPCA_figures_correct_only/full_PC_plot.pdf", sep=""),
+       plot=plot.full,
+       width=9,
+       height=16,
+       dpi=300,
+       create.dir=T,
+       units="in")
+
+showtext_opts(op)
+```
+
+## Individual PC plots: score by RT
+
+```{r rainbow_indivi_pc_plots_yx, fig.width=2, fig.height=6, echo=F}
+
+showtext_opts(dpi = 300)
+
+full.rainbow.fig <- list()
+
+for (pc in 1:ncomp) {
+  
+  ordered.rainbow <- c("#FFCC00", "#E82C42", "#59169C", "#1E8DD2", "#F46D43", "#29A343")
+  
+  pc.color <- ordered.rainbow[[pc]]
+  
+  fig1 <- pca.loadings %>% 
+    dplyr::filter(component == paste("PC", pc, sep="")) %>% 
+    mutate(component = paste(component, ": ", round(percent_var_explained, 2),
+                             "%",
+                             sep = "")) %>% 
+    ggplot(aes(x = time, 
+               y = loading,
+               color = component,
+               fill = component)) +
+    geom_vline(xintercept = c(0, 1, 2, 2.75),
+               linetype = "dashed",
+               color = "gray37") +
+    geom_line(color=pc.color, linewidth=1) +
+    geom_text(aes(label = event,
+                  x = time,
+                  y = 0.75),
+              data = ret_labels,
+              inherit.aes = FALSE,
+              angle = 90, 
+              hjust = 1,
+              vjust = 1.2,
+              size = 3,
+              colour = "gray37",
+              family = fontfamily) + 
+    facet_wrap(~component) +
+    ylim(-0.25, 1) +
+    labs(x = "Time (s)",
+         y = "PC loading") +
+    scale_color_brewer(palette="Set2") + 
+    scale_fill_brewer(palette="Set2") +
+    theme(legend.position = "none")
+  
+  fig2 <- subj.data.scores %>% 
+    dplyr::filter(component == paste("PC", pc, sep="")) %>% 
+    mutate(across(trial_outcome, 
+                  factor, 
+                  levels=c("Hit", "Miss", "CR", "FA"))) %>%
+    group_by(subjectId, association_strength, trial_outcome, component) %>% 
+    summarize(component_score = mean(component_score)) %>% 
+    summarySEwithin(., 
+                    measurevar="component_score", 
+                    withinvars=c("association_strength",
+                                 "trial_outcome",
+                                 "component"), 
+                    idvar="subjectId") %>% 
+    ggplot(aes(x = exp_id,
+               y = component_score,
+               fill = trial_outcome)) +
+    stat_summary(fun = "mean", 
+                 geom = "bar", 
+                 color = "black", 
+                 position=position_dodge()) +
+    geom_errorbar(aes(ymin=component_score-se, ymax=component_score+se),
+                  position=position_dodge(.9), 
+                  width=.2) +
+    facet_grid(cols=vars(association_strength), 
+               rows=vars(component)) +
+    scale_color_manual(values=c("#1a75ff", "#ff751a"), name="") +
+    scale_fill_manual(values=c("#1a75ff", "#ff751a"), name="") +
+    labs(x = "Memory outcome", y = "PC score") + 
+    theme(axis.text.x=element_blank())
+  
+  fig3 <- rt_data %>% 
+    dplyr::filter(component == paste("PC", pc, sep="")) %>% 
+    mutate(rt = round(match_response.rt, 1)) %>% 
+    group_by(association_strength) %>% 
+    mutate(rt_bin = cut_interval(rt, 
+                                 n = nbins)) %>%
+    ungroup() %>% 
+    group_by(subjectId, trial_outcome, association_strength,
+             component, rt_bin) %>% 
+    summarize(component_score = mean(component_score)) %>% 
+    summarySEwithin(., 
+                    measurevar="component_score", 
+                    withinvars=c("association_strength",
+                                 "trial_outcome",
+                                 "component",
+                                 "rt_bin"), 
+                    idvar="subjectId") %>% 
+    mutate(across(component,
+                  factor,
+                  levels=ordered_pcs)) %>%
+    ggplot(aes(x = rt_bin,
+               y = component_score,
+               color = trial_outcome,
+               group = trial_outcome)) +
+    geom_line(linewidth=0.8) +
+    geom_point(size=1.5) +
+    geom_errorbar(aes(ymin=component_score-se, ymax=component_score+se),
+                  width=0.2) +
+    facet_grid(cols=vars(association_strength), 
+               rows=vars(component)) +
+    scale_color_manual(values=c("#1a75ff", "#ff751a"), name="") +
+    scale_fill_manual(values=c("#1a75ff", "#ff751a"), name="") +
+    labs(y = "PC score", x = "RT bin") +
+    guides(color = "none") + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  full.rainbow.fig[[pc]] <- fig1 / fig2 / fig3
+}
+
+rainbow.fig <- (full.rainbow.fig[[2]] |
+                  full.rainbow.fig[[5]] |
+                  full.rainbow.fig[[1]] | 
+                  full.rainbow.fig[[6]] | 
+                  full.rainbow.fig[[3]] | 
+                  full.rainbow.fig[[4]]) + 
+  plot_layout(
+    guides = "collect", axes = "collect", axis_titles = "collect") &
+  theme(strip.text.x = element_text(size=12),
+        strip.text.y = element_blank(),
+        strip.background = element_blank(),
+        text = element_text(size = 10),
+        legend.position = "left"
+  )
+
+ggsave(paste("tPCA_figures_correct_only/rainbow_all_PC_scores_and_RT_yx.pdf", sep=""),
+       plot=rainbow.fig,
+       width=40, 
+       height=18, 
+       dpi=300,
+       create.dir=T,
+       units="cm")
+
+showtext_opts(op)
+
+```
+
+```{r rainbow_with_titles_indivi_pc_plots_yx, fig.width=2, fig.height=6, echo=F}
+
+showtext_opts(dpi = 300)
+
+titles <- list("PC1"="'Memory reinstatement strength'",
+               "PC2"="'Preparatory attention'",
+               "PC3"="'Prediction error x strength'",
+               "PC4"="'Orienting response to errors'",
+               "PC5"="'Cognitive effort'",
+               "PC6"="'Mismatch detection'")
+
+full.rainbow.fig <- list()
+
+for (pc in 1:ncomp) {
+  
+  ordered.rainbow <- c("#FFCC00", "#E82C42", "#59169C", "#1E8DD2", "#F46D43", "#29A343")
+  
+  pc.color <- ordered.rainbow[[pc]]
+  
+  fig1 <- pca.loadings %>% 
+    dplyr::filter(component == paste("PC", pc, sep="")) %>% 
+    mutate(component = paste(component, ": ", round(percent_var_explained, 2),
+                             "%",
+                             sep = "")) %>% 
+    ggplot(aes(x = time, 
+               y = loading,
+               color = component,
+               fill = component)) +
+    geom_vline(xintercept = c(0, 1, 2, 2.75),
+               linetype = "dashed",
+               color = "gray37") +
+    geom_line(color=pc.color, linewidth=1) +
+    geom_text(aes(label = event,
+                  x = time,
+                  y = 0.75),
+              data = ret_labels,
+              inherit.aes = FALSE,
+              angle = 90, 
+              hjust = 1,
+              vjust = 1.2,
+              size = 3,
+              colour = "gray37",
+              family = fontfamily) + 
+    facet_wrap(~component) +
+    ylim(-0.25, 1) +
+    labs(x = "Time (s)",
+         y = "PC loading",
+         title = titles[[pc]]) +
+    theme(legend.position = "none",
+          plot.title=element_text(hjust=0),
+          plot.subtitle=element_text(size=12))
+  
+  fig2 <- subj.data.scores %>% 
+    dplyr::filter(component == paste("PC", pc, sep="")) %>% 
+    mutate(across(trial_outcome, 
+                  factor, 
+                  levels=c("Hit", "Miss", "CR", "FA"))) %>%
+    group_by(subjectId, association_strength, trial_outcome, component) %>% 
+    summarize(component_score = mean(component_score)) %>% 
+    summarySEwithin(., 
+                    measurevar="component_score", 
+                    withinvars=c("association_strength",
+                                 "trial_outcome",
+                                 "component"), 
+                    idvar="subjectId") %>% 
+    ggplot(aes(x = exp_id,
+               y = component_score,
+               fill = trial_outcome)) +
+    stat_summary(fun = "mean", 
+                 geom = "bar", 
+                 color = "black", 
+                 position=position_dodge()) +
+    geom_errorbar(aes(ymin=component_score-se, ymax=component_score+se),
+                  position=position_dodge(.9), 
+                  width=.2) +
+    facet_grid(cols=vars(association_strength), 
+               rows=vars(component)) +
+    scale_color_manual(values=c("#1a75ff", "#ff751a"), name="") +
+    scale_fill_manual(values=c("#1a75ff", "#ff751a"), name="") +
+    labs(x = "Memory outcome", y = "PC score") + 
+    theme(axis.text.x=element_blank())
+  
+  fig3 <- rt_data %>% 
+    dplyr::filter(component == paste("PC", pc, sep="")) %>% 
+    mutate(rt = round(match_response.rt, 1)) %>% 
+    group_by(association_strength) %>% 
+    mutate(rt_bin = cut_interval(rt, 
+                                 n = nbins)) %>%
+    ungroup() %>% 
+    group_by(subjectId, trial_outcome, association_strength,
+             component, rt_bin) %>% 
+    summarize(component_score = mean(component_score)) %>% 
+    summarySEwithin(., 
+                    measurevar="component_score", 
+                    withinvars=c("association_strength",
+                                 "trial_outcome",
+                                 "component",
+                                 "rt_bin"), 
+                    idvar="subjectId") %>% 
+    mutate(across(component,
+                  factor,
+                  levels=ordered_pcs)) %>%
+    ggplot(aes(x = rt_bin,
+               y = component_score,
+               color = trial_outcome,
+               group = trial_outcome)) +
+    geom_line(linewidth=0.8) +
+    geom_point(size=1.5) +
+    geom_errorbar(aes(ymin=component_score-se, ymax=component_score+se),
+                  width=0.2) +
+    facet_grid(cols=vars(association_strength), 
+               rows=vars(component)) +
+    scale_color_manual(values=c("#1a75ff", "#ff751a"), name="") +
+    scale_fill_manual(values=c("#1a75ff", "#ff751a"), name="") +
+    labs(y = "PC score", x = "RT bin") +
+    guides(color = "none") + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  full.rainbow.fig[[pc]] <- fig1 / fig2 / fig3
+}
+
+rainbow.fig <- (full.rainbow.fig[[2]] |
+                  full.rainbow.fig[[5]] |
+                  full.rainbow.fig[[1]] | 
+                  full.rainbow.fig[[6]] | 
+                  full.rainbow.fig[[3]] | 
+                  full.rainbow.fig[[4]]) + 
+  plot_layout(guides="collect",
+              tag_level = 'new') +
+  plot_annotation(tag_levels = list(c("A", "", "",
+                                      "B", "", "",
+                                      "C", "", "", 
+                                      "D", "", "",
+                                      "E", "", "",
+                                      "F", "", ""))) &
+  theme(strip.text.x = element_text(size=12),
+        strip.text.y = element_blank(),
+        strip.background = element_blank(),
+        text = element_text(size = 10),
+        plot.margin = margin(0, 10, 0, 10),
+        plot.title.position = "plot",
+        plot.subtitle=element_text(hjust=0, margin=margin(t=5)),
+        plot.tag = element_text(face="bold", margin=margin(t=5, b=5)),
+        axis.title.y = element_text(margin = margin(r=0)),
+        axis.text.y = element_text(margin = margin(l=3, r=3)))
+
+ggsave(paste("tPCA_figures_correct_only/rainbow_all_PC_scores_and_RT_titled_yx.pdf", sep=""),
+       plot=rainbow.fig,
+       width=46, 
+       height=16, 
+       dpi=300,
+       create.dir=T,
+       units="cm")
+
+showtext_opts(op)
+
+```
+
+```{r custom_indivi_pc_plots_yx, fig.width=6, fig.height=2, echo=F}
+
+indiv_pc_plots <- list()
+
+showtext_opts(dpi = 300)
+
+for (pc in 1:ncomp) {
+  fig1 <- pca.loadings %>% 
+    dplyr::filter(component == paste("PC", pc, sep="")) %>%
+    mutate(component = paste(component, ": ", round(percent_var_explained, 2),
+                             "%",
+                             sep = "")) %>% 
+    ggplot(aes(x = time, 
+               y = loading,
+               color = component,
+               fill = component)) +
+    geom_vline(xintercept = c(0, 1, 2, 2.75),
+               linetype = "dashed",
+               color = "gray37") +
+    geom_line(color="black", linewidth=1) +
+    geom_text(aes(label = event,
+                  x = time,
+                  y = 0.75),
+              data = ret_labels,
+              inherit.aes = FALSE,
+              angle = 90, 
+              hjust = 1,
+              vjust = 1.2,
+              size = 4,
+              colour = "gray37",
+              family = fontfamily) + 
+    facet_wrap(~component) +
+    ylim(-0.25, 1) +
+    labs(x = "Time (s)",
+         y = "PC loading",
+         subtitle = titles[[paste("PC", pc, sep="")]]) +
+    scale_color_brewer(palette="Set2") + 
+    scale_fill_brewer(palette="Set2") +
+    theme(legend.position = "none",
+          plot.title=element_text(hjust=-0.1),
+          plot.subtitle=element_text(size=12))
+  
+  fig2 <- subj.data.scores %>% 
+    dplyr::filter(component == paste("PC", pc, sep="")) %>% 
+    mutate(across(trial_outcome, 
+                  factor, 
+                  levels=c("Hit", "Miss", "CR", "FA"))) %>%
+    group_by(subjectId, association_strength, trial_outcome, component) %>% 
+    summarize(component_score = mean(component_score)) %>% 
+    summarySEwithin(., 
+                    measurevar="component_score", 
+                    withinvars=c("association_strength",
+                                 "trial_outcome",
+                                 "component"), 
+                    idvar="subjectId") %>% 
+    ggplot(aes(x = exp_id,
+               y = component_score,
+               fill = trial_outcome)) +
+    stat_summary(fun = "mean", 
+                 geom = "bar", 
+                 color = "black", 
+                 position=position_dodge()) +
+    geom_errorbar(aes(ymin=component_score-se, ymax=component_score+se),
+                  position=position_dodge(.9), 
+                  width=.2) +
+    facet_grid(cols=vars(association_strength), 
+               rows=vars(component)) +
+    scale_color_manual(values=c("#1a75ff", "#ff751a"), name="") +
+    scale_fill_manual(values=c("#1a75ff", "#ff751a"), name="") +
+    labs(x = "", y = "PC score") + 
+    theme(axis.title.x=element_blank(),
+          axis.text.x=element_blank(),
+          axis.ticks.x=element_blank())
+  
+  fig3 <- rt_data %>% 
+    dplyr::filter(component == paste("PC", pc, sep="")) %>% 
+    mutate(rt = round(match_response.rt, 1)) %>% 
+    group_by(association_strength) %>% 
+    mutate(rt_bin = cut_interval(rt, 
+                                 n = nbins)) %>%
+    ungroup() %>% 
+    group_by(subjectId, trial_outcome, association_strength,
+             component, rt_bin) %>% 
+    summarize(component_score = mean(component_score)) %>% 
+    summarySEwithin(., 
+                    measurevar="component_score", 
+                    withinvars=c("association_strength",
+                                 "trial_outcome",
+                                 "component",
+                                 "rt_bin"), 
+                    idvar="subjectId") %>% 
+    mutate(across(component,
+                  factor,
+                  levels=ordered_pcs)) %>%
+    ggplot(aes(x = rt_bin,
+               y = component_score,
+               color = trial_outcome,
+               group = trial_outcome)) +
+    geom_line(linewidth=0.8) +
+    geom_point(size=1.5) +
+    geom_errorbar(aes(ymin=component_score-se, ymax=component_score+se),
+                  width=0.2) +
+    facet_grid(cols=vars(association_strength), 
+               rows=vars(component)) +
+    scale_color_manual(values=c("#1a75ff", "#ff751a"), name="") +
+    scale_fill_manual(values=c("#1a75ff", "#ff751a"), name="") +
+    labs(y = "PC score", x = "RT bin") +
+    guides(color = "none") + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  joint.fig <- (fig1 + fig2 + fig3) +
+    plot_layout(widths=c(1,1,1), 
+                guides="collect", axes = "collect", axis_titles = "collect") &
+    theme(strip.text.x = element_text(size=12),
+          strip.text.y = element_blank(),
+          strip.background = element_blank(),
+          text = element_text(size = 10),
+          plot.title=element_text(hjust=0.5)
+    )
+  
+  indiv_pc_plots[[paste("PC", pc, sep="")]] <- fig1 + fig2 + fig3
+  
+  # ggsave(paste("tPCA_figures_correct_only/PC", pc, "_scores_and_RT.pdf", sep=""),
+  #        plot=joint.fig,
+  #        width=22, 
+  #        height=7, 
+  #        dpi=300,
+  #        units="cm")
+}
+
+plot.full <- (indiv_pc_plots[["PC2"]] / 
+                indiv_pc_plots[["PC5"]] / 
+                indiv_pc_plots[["PC1"]] / 
+                indiv_pc_plots[["PC6"]] / 
+                indiv_pc_plots[["PC3"]] / 
+                indiv_pc_plots[["PC4"]]) +
+  plot_layout(guides="collect",
+              tag_level = 'new') +
+  plot_annotation(tag_levels = list(c("A", "", "",
+                                      "B", "", "",
+                                      "C", "", "", 
+                                      "D", "", "",
+                                      "E", "", "",
+                                      "F", "", ""))) &
+  theme(strip.text.x = element_text(size=12),
+        strip.text.y = element_blank(),
+        strip.background = element_blank(),
+        text = element_text(size = 10),
+        plot.margin = margin(0, 0, 0, 5),
+        plot.title.position = "plot",
+        plot.subtitle=element_text(hjust=0, margin=margin(t=5)),
+        plot.tag = element_text(face="bold", margin=margin(t=0)),
+        axis.title.y = element_text(margin = margin(r=0)),
+        axis.text.y = element_text(margin = margin(l=3, r=3)))
+
+ggsave(paste("tPCA_figures_correct_only/full_PC_plot_yx.pdf", sep=""),
+       plot=plot.full,
+       width=9,
+       height=16,
+       dpi=300,
+       create.dir=T,
+       units="in")
+
+showtext_opts(op)
+```
+
+## Subsequent memory - CR trials
+
+```{r submem_hist, echo=F, eval=T}
+palette <- c("#59735e", "#b7c8ba")
+
+subj.data.submem <- subj.data.scores %>% 
+  left_join(recognition_behavior,
+            by = c("subjectId", "expId", "img"),
+            suffix = c(".retrieval", ".recognition")) %>%
+  dplyr::filter(!is.na(trial_outcome.recognition)) %>% 
+  dplyr::filter(trial_outcome.retrieval == "CR") %>% 
+  mutate(across(trial_outcome.recognition, 
+                factor, 
+                levels=c("Hit", "Miss")))
+```
+
+```{r same_tempPCA_submem, echo=F, fig.width=10, fig.height=12, eval=T}
+
+submem.plt <- subj.data.submem %>%
+  group_by(subjectId, association_strength, trial_outcome.recognition, component, expId) %>% 
+  summarize(component_score = mean(component_score)) %>% 
+  summarySEwithin(., 
+                  measurevar="component_score", 
+                  withinvars=c("association_strength",
+                               "trial_outcome.recognition",
+                               "component"), 
+                  betweenvars=c("expId"),
+                  idvar="subjectId") %>% 
+  mutate(across(component,
+                factor,
+                levels=ordered_pcs)) %>%
+  ggplot(aes(x = association_strength,
+             y = component_score,
+             fill = trial_outcome.recognition)) +
+  stat_summary(fun = "mean", 
+               geom = "bar", 
+               color = "black", 
+               position=position_dodge()) +
+  geom_errorbar(aes(ymin=component_score-se, ymax=component_score+se),
+                position=position_dodge(.9), 
+                width=.2) +
+  scale_color_manual(values=hit_miss_palette, name="") +
+  scale_fill_manual(values=hit_miss_palette, name="") +
+  labs(x = "", y = "PC score") +
+  theme(strip.text.y = element_blank()) + 
+  facet_grid(rows = vars(component),
+             cols = vars(expId))
+
+loadings.vrt.plt + submem.plt + 
+  plot_layout(widths=c(1,2,2)) 
+
+```
+
+### Models
+
+```{r recog_models, echo=F, results="asis", eval=run_models}
+
+recog.lmer.models <- list()
+
+for (i in 1:ncomp) {
+  mod.data <- subj.data.submem %>%
+    dplyr::filter(component == paste("PC", i, sep=""))
+  
+  mod <- mod.data %>% 
+    lmer(component_score ~ trial_outcome.recognition * association_strength * expId + 
+           (trial_outcome.recognition * association_strength | subjectId),
+         data = .)
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>% 
+      lmer(component_score ~ trial_outcome.recognition * association_strength * expId + 
+             (trial_outcome.recognition + association_strength + expId | subjectId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>% 
+      lmer(component_score ~ trial_outcome.recognition * association_strength * expId + 
+             (1 | subjectId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    print("MODEL DID NOT CONVERGE") 
+  }
+  
+  recog.lmer.models[[i]] <- mod 
+}
+
+```
+
+```{r show_recog_mods, echo=F, results="asis"}
+
+for (i in 1:ncomp) {
+  mod <- recog.lmer.models[[i]]
+  
+  tidy(mod, effects = "fixed", conf.int = T, conf.level = 0.95) %>% 
+    select(term, estimate, conf.low, conf.high, p.value, std.error, df) %>% 
+    kable(caption=paste("PC", i, ": ", formula(mod)[3], sep=""),
+          digits=3) %>% 
+    kable_styling() %>%
+    cat()
+  
+  tidy(mod, effects = "ran_pars", scales = "vcov") %>% 
+    select(term, estimate) %>% 
+    kable(digits=3, caption="Random effects") %>% 
+    kable_styling() %>% 
+    cat()
+  
+  emm <- emmeans(mod, ~ trial_outcome.recognition | association_strength | expId, adjust="bonferroni")
+  emm.pairs <- pairs(emm)
+  tidy(emm.pairs, effects = "fixed", conf.int = T, conf.level = 0.95) %>% 
+    select(expId, association_strength, contrast, estimate, conf.low, conf.high, p.value, std.error) %>% 
+    kable(digits=3) %>% 
+    kable_styling() %>% 
+    cat()
+  
+}
+
+```
+
+## Subsequent memory RT
+
+
+```{r rt_data_submem, echo=F}
+### joint plot
+rt_data.submem <- subj.data.submem %>%
+  mutate(trial_outcome.recognition = as.character(trial_outcome.recognition)) %>% 
+  dplyr::filter(trial_outcome.recognition %in% c("Hit")) %>% 
+  # mutate(across(association_strength, 
+  #                 factor, 
+  #                 levels=c("Weak (1x)", "Strong (4x)"))) %>% 
+  mutate(across(association_strength, 
+                factor, 
+                levels=c("Strong (4x)", "Weak (1x)")))
+```
+
+```{r submem_rt_joint_plot, echo=F, fig.width=10, fig.height=8, results="asis", eval=run_models}
+models.recog.rt <- list()
+
+for (pc in 1:ncomp) {
+  mod <- rt_data.submem %>% 
+    dplyr::filter(component == paste("PC", pc, sep="")) %>% 
+    mutate(recognition_response.rt = log(recognition_response.rt)) %>%  
+    lmer(recognition_response.rt ~ component_score * association_strength * expId + 
+           (component_score * association_strength * expId | subjectId),
+         data = .)
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- rt_data.submem %>% 
+      dplyr::filter(component == paste("PC", pc, sep="")) %>% 
+      mutate(recognition_response.rt = log(recognition_response.rt)) %>%  
+      lmer(recognition_response.rt ~ component_score * association_strength * expId + 
+             (component_score + association_strength + expId | subjectId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- rt_data.submem %>% 
+      dplyr::filter(component == paste("PC", pc, sep="")) %>% 
+      mutate(recognition_response.rt = log(recognition_response.rt)) %>%  
+      lmer(recognition_response.rt ~ component_score * association_strength * expId + 
+             (component_score | subjectId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- rt_data.submem %>% 
+      dplyr::filter(component == paste("PC", pc, sep="")) %>% 
+      mutate(recognition_response.rt = log(recognition_response.rt)) %>%  
+      lmer(recognition_response.rt ~ component_score * association_strength * expId + 
+             (1 | subjectId),
+           data = .)
+  }
+  
+  models.recog.rt[[pc]] <- mod
+  
+}
+
+
+```
+
+
+```{r submem.binned.rt, echo=F, fig.width=7, fig.height=10, eval=T}
+
+nbins <- 4
+
+rt.binned.plt <- rt_data.submem %>% 
+  mutate(trial_outcome = trial_outcome.recognition) %>% 
+  mutate(across(association_strength, 
+                factor, 
+                levels=c("Strong (4x)", "Weak (1x)"))) %>% 
+  group_by(subjectId, component, association_strength, trial_outcome, expId) %>%
+  mutate(trial_count = n()) %>%
+  ungroup() %>%
+  dplyr::filter(trial_count > nbins-1) %>%
+  group_by(subjectId, component, association_strength, trial_outcome, expId) %>% 
+  mutate(component_score_bin = cut_interval(component_score, 
+                                            n = nbins,
+                                            labels = F)) %>% 
+  ungroup() %>% 
+  group_by(subjectId, trial_outcome, association_strength,
+           component, component_score_bin, expId) %>% 
+  summarize(rt = median(recognition_response.rt)) %>% 
+  summarySEwithin(., 
+                  measurevar="rt", 
+                  withinvars=c("association_strength",
+                               "trial_outcome",
+                               "component",
+                               "component_score_bin"), 
+                  betweenvars=c("expId"),
+                  idvar="subjectId") %>% 
+  mutate(across(component,
+                factor,
+                levels=ordered_pcs)) %>%
+  ggplot(aes(x = as.numeric(as.character(component_score_bin)),
+             y = rt,
+             color = association_strength,
+             group = association_strength)) +
+  geom_line(linewidth=0.8) +
+  geom_point(size=1.5) +
+  geom_errorbar(aes(ymin=rt-se, ymax=rt+se),
+                width=0.2) +
+  facet_grid(rows=vars(component), 
+             axes="all",
+             scales = "free") +
+  scale_color_manual(values=palette, name="") +
+  scale_fill_manual(values=palette, name="") +
+  labs(x = "PC score", y = "RT (s)") +
+  theme(strip.text.y = element_blank()) + 
+  facet_grid(rows = vars(component),
+             cols = vars(expId))
+
+loadings.vrt.plt + rt.binned.plt +
+  plot_layout(widths=c(1,1.5))
+
+```
+
+### Models
+
+```{r print_submem_rt_models, echo=F, results="asis", eval=T}
+for (pc in 1:ncomp) {
+  tidy(models.recog.rt[[pc]], effects = "fixed", conf.int = T, conf.level = 0.95) %>% 
+    select(term, estimate, conf.low, conf.high, p.value, std.error, df) %>% 
+    kable(caption=paste("PC", pc, ": ", formula(mod)[3], sep=""),
+          digits=3) %>% 
+    kable_styling() %>% 
+    cat()
+  
+  tidy(models.recog.rt[[pc]], effects = "ran_pars", scales = "vcov") %>% 
+    select(term, estimate) %>% 
+    kable(digits=3, caption="Random effects") %>% 
+    kable_styling() %>% 
+    cat()
+}
+```
+
+## Joint plot
+
+```{r submem_joint_plt, echo=F, fig.width=9, fig.height=10, eval=T}
+loadings.vrt.plt + 
+  (submem.plt + 
+     theme(legend.position="none")) +
+  rt.binned.plt +
+  plot_layout(widths=c(1,1,1))
+```
+
+
+## Individual PC plots
+
+```{r indivi_pc_plots_submem_mod, fig.width=6, fig.height=2, echo=F, eval=T}
+showtext_opts(dpi = 300)
+for (pc in 1:ncomp) {
+  fig1 <- pca.loadings %>% 
+    dplyr::filter(component == paste("PC", pc, sep="")) %>% 
+    mutate(component = paste(component, ": ", round(percent_var_explained, 2),
+                             "%",
+                             sep = "")) %>% 
+    ggplot(aes(x = time, 
+               y = loading,
+               color = component,
+               fill = component)) +
+    geom_vline(xintercept = c(0, 1, 2, 2.75),
+               linetype = "dashed",
+               color = "gray37") +
+    geom_line(color="black", linewidth=1) +
+    geom_text(aes(label = event,
+                  x = time,
+                  y = 0.75),
+              data = ret_labels,
+              inherit.aes = FALSE,
+              angle = 90, 
+              hjust = 1,
+              vjust = 1.2,
+              size = 3,
+              colour = "gray37",
+              family = fontfamily) + 
+    facet_wrap(~component) +
+    ylim(-0.25, 1) +
+    labs(x = "Time (s)",
+         y = "PC loading") +
+    scale_color_brewer(palette="Set2") + 
+    scale_fill_brewer(palette="Set2") +
+    theme(legend.position = "none",
+          strip.text.x = element_text(size=12))
+  
+  fig2 <- subj.data.submem %>%
+    dplyr::filter(component == paste("PC", pc, sep="")) %>% 
+    group_by(subjectId, association_strength, trial_outcome.recognition, component, expId) %>% 
+    summarize(component_score = mean(component_score)) %>% 
+    summarySEwithin(., 
+                    measurevar="component_score", 
+                    withinvars=c("association_strength",
+                                 "trial_outcome.recognition",
+                                 "component"), 
+                    betweenvars=c("expId"),
+                    idvar="subjectId") %>% 
+    mutate(across(component,
+                  factor,
+                  levels=ordered_pcs)) %>%
+    ggplot(aes(x = trial_outcome.recognition,
+               y = component_score,
+               fill = association_strength)) +
+    stat_summary(fun = "mean", 
+                 geom = "bar", 
+                 color = "black", 
+                 position=position_dodge()) +
+    geom_errorbar(aes(ymin=component_score-se, ymax=component_score+se),
+                  position=position_dodge(.9), 
+                  width=.2) +
+    facet_wrap(~component, scales = "free", ncol=1) +
+    scale_color_manual(values=palette, name="") +
+    scale_fill_manual(values=palette, name="") +
+    labs(x = "", y = "PC score") +
+    theme(#strip.text.x = element_blank(),
+          strip.text.y = element_blank()) + 
+    facet_grid(cols = vars(expId))
+  
+  fig3 <- rt_data.submem %>% 
+    dplyr::filter(component == paste("PC", pc, sep="")) %>% 
+    mutate(trial_outcome = trial_outcome.recognition) %>% 
+    mutate(across(association_strength, 
+                  factor, 
+                  levels=c("Strong (4x)", "Weak (1x)"))) %>% 
+    group_by(subjectId, component, association_strength, trial_outcome, expId) %>%
+    mutate(trial_count = n()) %>%
+    ungroup() %>%
+    dplyr::filter(trial_count > nbins-1) %>%
+    group_by(subjectId, component, association_strength, trial_outcome, expId) %>% 
+    mutate(component_score_bin = cut_interval(component_score, 
+                                              n = nbins,
+                                              labels = F)) %>% 
+    ungroup() %>% 
+    group_by(subjectId, trial_outcome, association_strength,
+             component, component_score_bin, expId) %>% 
+    summarize(rt = median(recognition_response.rt)) %>% 
+    summarySEwithin(., 
+                    measurevar="rt", 
+                    withinvars=c("association_strength",
+                                 "trial_outcome",
+                                 "component",
+                                 "component_score_bin"), 
+                    betweenvars=c("expId"),
+                    idvar="subjectId") %>% 
+    mutate(across(component,
+                  factor,
+                  levels=ordered_pcs)) %>%
+    ggplot(aes(x = as.numeric(as.character(component_score_bin)),
+               y = rt,
+               color = association_strength,
+               group = association_strength)) +
+    geom_line(linewidth=0.8) +
+    geom_point(size=1.5) +
+    geom_errorbar(aes(ymin=rt-se, ymax=rt+se),
+                  width=0.2) +
+    facet_grid(rows=vars(component), 
+               axes="all",
+               scales = "free") +
+    scale_color_manual(values=palette, name="") +
+    scale_fill_manual(values=palette, name="") +
+    labs(x = "PC score quartile", y = "RT (s)") +
+    guides(color="none") + 
+    theme(#strip.text.x = element_blank(),
+          strip.text.y = element_blank()) +
+    facet_grid(cols = vars(expId))
+  
+  joint.fig <- (fig1 + fig2 + fig3) +
+    plot_layout(widths=c(1,2,2), 
+                guides="collect", axes = "collect", axis_titles = "collect") &
+    theme(strip.text.y = element_blank(),
+          strip.background = element_blank(),
+          text = element_text(size = 10),
+    )
+  
+  joint.fig %>% 
+    print()
+  
+  ggsave(paste("tPCA_figures_correct_only/submem_PC", pc, "_scores_and_RT.pdf", sep=""),
+         plot=joint.fig,
+         width=22, 
+         height=7, 
+         dpi=300,
+         create.dir=T,
+         units="cm")
+}
+showtext_opts(op)
+```
+
+
+## Save
+
+```{r save_models, echo=F, eval=run_models}
+save(models, 
+     models.compact.no.mismatch, 
+     models.rt, 
+     recog.lmer.models,
+     models.recog.rt,
+     file="tpca_models_correct_only.RData")
+
+```

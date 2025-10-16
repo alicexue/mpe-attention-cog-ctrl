@@ -1,0 +1,1115 @@
+---
+title: "Temporal PCA on pupil data - bootstrapping"
+author: "Alice M. Xue (alicexue@stanford.edu)"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 3
+    toc_float:
+      collapsed: no
+    self_contained: true
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+---
+
+```{r setup, include=FALSE}
+library(plyr)
+library(tidymv)
+library(Hmisc)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+library(data.table)
+library(psycho)
+library(lme4)
+library(sjPlot)
+library(afex)
+library(wesanderson)
+library(viridis)
+library(showtext)
+library(tidyverse)
+library(mgcv)
+library(itsadug)
+library(RColorBrewer)
+library(ggcorrplot)
+library(devtools)
+library(factoextra)
+library(tidyjson)
+library(purrr)
+library(broom)
+library(zoo)
+library(psych)
+library(patchwork)
+library(emmeans)
+library(ggpubr)
+library(stats)
+library(broom.mixed)
+library(pracma)
+library(afex)
+library(stringr)
+library(gsignal)
+
+font_add(family = "Avenir Next",
+         regular = "../utils/AvenirNext-Regular.ttf",
+         bold = "../utils/AvenirNext-DemiBold.ttf",
+         italic = "../utils/AvenirNext-Italic.ttf")
+showtext.auto()
+op <- showtext_opts()
+
+fontfamily <- "Avenir Next"
+
+set_theme(
+  base=theme_classic(base_size = 12,
+                     base_family="Avenir Next")
+  
+)
+
+options(dplyr.summarise.inform = FALSE)
+
+# knitr::opts_chunk$set(dev = 'pdf') # set output device to pdf
+
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message = FALSE)
+```
+
+```{r, echo=F}
+source("../utils/summary_se_utils.R")
+```
+
+```{r get_behavior, echo=F}
+
+set.seed(478)
+
+data_ret <- fread("../../data/behavior/MPE_asso_retrieval_behavior.csv") %>% 
+  mutate(key = match_response.keys,
+         rt = match_response.rt * 1000)
+
+data_recog <- fread("../../data/behavior/MPE_mismatch_recog_behavior.csv") %>% 
+  mutate(rt = recognition_response.rt * 1000)
+
+recognition_behavior <- data_recog %>%
+  mutate(trialN = trials.thisTrialN) %>% 
+  select(trialN,
+         recognition_response.keys,
+         recognition_response.rt,
+         is_old,
+         img,
+         subjectId,
+         expId) %>%
+  mutate(hit = is_old & (recognition_response.keys==1)) %>%
+  mutate(false_alarm = !is_old & (recognition_response.keys==1)) %>%
+  mutate(miss = is_old & (recognition_response.keys==2)) %>%
+  mutate(correct_rejection = !is_old & (recognition_response.keys==2)) %>%
+  mutate(trial_outcome = case_when(hit ~ "Hit",
+                                   false_alarm ~ "FA",
+                                   miss ~ "Miss",
+                                   correct_rejection ~ "CR")) %>%
+  group_by(subjectId,
+           trialN,
+           trial_outcome,
+           is_old,
+           img,
+           recognition_response.keys,
+           expId) %>%
+  summarize(recognition_response.rt = mean(recognition_response.rt)) %>%
+  ungroup() 
+
+prev_trial_data_ret <- data_ret %>% 
+  mutate(hit = is_match_trial & (match_response.keys==1)) %>%
+  mutate(false_alarm = !is_match_trial & (match_response.keys==1)) %>%
+  mutate(miss = is_match_trial & (match_response.keys==2)) %>%
+  mutate(correct_rejection = !is_match_trial & (match_response.keys==2)) %>%
+  mutate(trial_outcome = case_when(hit ~ "Hit",
+                                   false_alarm ~ "FA",
+                                   miss ~ "Miss",
+                                   correct_rejection ~ "CR")) %>% 
+  group_by(subjectId, block_n) %>% 
+  mutate(trials.thisTrialN = trials.thisTrialN+1) %>% 
+  mutate(previous_trial_outcome = trial_outcome) %>% 
+  mutate(previous_trial_association_strength = association_strength) %>% 
+  mutate(trialN_block = trials.thisTrialN) %>% 
+  select(subjectId, block_n, trialN_block, 
+         previous_trial_outcome, previous_trial_association_strength)
+```
+
+```{r save_or_load_data, echo=F}
+retrieval_pupil <- fread("../../data/pupil/MPE_imm_retrieval_pupil.csv") 
+
+retrieval_pupil.del <- fread("../../data/pupil/MPE_del_retrieval_pupil.csv") 
+
+retrieval_pupil <- bind_rows(retrieval_pupil, retrieval_pupil.del) %>% 
+  mutate(expId = case_when(grepl("MPE1", subjectId) ~ "imm",
+                           grepl("MPE3", subjectId) ~ "del",
+                           grepl("MPE5", subjectId) ~ "del")) %>%
+  mutate(across(expId, 
+                factor, 
+                levels=c("imm", "del"))) %>% 
+  mutate(room_setup = case_when(grepl("MPE1", subjectId) ~ "1", # eeg + pupil, shared-eeg lab
+                                grepl("MPE3", subjectId) ~ "2", # pupil only, shared-eeg lab
+                                grepl("MPE5", subjectId) ~ "3")) # pupil only, 4th floor lab
+```
+
+```{r labels, echo=F}
+
+palette <- c("#008080", "#9fdfbf")
+hit_miss_palette <- c("#6E9075", "#FC7753")
+
+ret_labels_strong <- tibble(event = c("cue", "delay", "probe", "ITI"),
+                            time = c(0, 1, 2, 2.75))
+
+ret_labels_weak <- tibble(event = c("cue", "delay", "probe", "ITI"),
+                          time = c(0, 1, 2, 2.75))
+
+ret_labels <- rbind(ret_labels_strong, ret_labels_weak)
+ret_labels$position <- 0.12
+```
+
+# Temporal PCA
+
+## Trial level
+
+```{r tempPCA_trial, echo=F}
+subj_timeseries_trial <- retrieval_pupil %>% 
+  dplyr::filter(trial_outcome %in% c("Hit", "CR")) %>% 
+  mutate(pupil_diameter = pupil_diameter_z)
+
+subj_timeseries_trial %>% 
+  pivot_wider(id_cols = c("subjectId", "trial_outcome", 
+                          "match_response.rt",
+                          "association_strength", "trialN", "img"),
+              names_from = c("time"), 
+              values_from = c("pupil_diameter")) %>% 
+  mutate(across(trial_outcome, 
+                factor, 
+                levels=c("Hit", "CR", "Miss", "FA"))) %>% 
+  group_by(trial_outcome, association_strength) %>% 
+  summarize(count = n()) %>% 
+  ungroup() %>% 
+  mutate(total_ntrials = sum(count)) %>% 
+  mutate(percent_data = round(count / total_ntrials * 100, 2)) %>% 
+  kable() %>% 
+  kable_styling(bootstrap_options = "striped", 
+                full_width = F, 
+                position = "left")
+
+subj.data <- subj_timeseries_trial %>% 
+  pivot_wider(id_cols = c("trial_outcome",
+                          "association_strength", 
+                          "subjectId",
+                          "trialN",
+                          "img",
+                          "trialN_block", 
+                          "match_response.rt",
+                          "block"),
+              names_from = c("time"), 
+              values_from = c("pupil_diameter"))
+```
+
+
+```{r def_functions, echo=F}
+ncomp <- 6
+pc_names <- paste("PC", 1:ncomp, sep = "")
+
+run_tPCA <- function(input.data, ncomp, sample) {
+  # pc_names <- paste("PC", 1:ncomp, sep = "")
+  
+  subj.data <- input.data
+  
+  if (sample) {
+    subj.data <- subj.data %>% 
+      slice_sample(n=nrow(.), replace=T)
+  }
+  
+  pca_input <- subj.data %>% 
+    select(-trial_outcome, -association_strength, -subjectId, 
+           -match_response.rt,
+           -trialN, -img, -trialN_block, -block) 
+  
+  data.pca        <- prcomp(pca_input, center=T, scale=T)
+  
+  if (!sample) {
+    # scree plot
+    plot(data.pca)
+  }
+  
+  # change the sign of PC1, 4, 5 columns to flip the sign of the loadings
+  rot <- data.pca$rotation
+  rot[, c(4)] <- rot[, c(4)] * -1
+  data.pca$rotation <- rot
+  
+  raw.loadings     <- data.pca$rotation[,1:ncomp] %*% diag(data.pca$sdev, ncomp, ncomp)
+  rotated.loadings <- varimax(raw.loadings)$loadings
+  inv.loadings     <- t(pracma::pinv(rotated.loadings))
+  loadings         <- rotated.loadings
+  scores           <- scale(pca_input) %*% inv.loadings
+  subj.pred        <- as_tibble(scores) %>% 
+    rename_with(~ gsub("V", "PC", .))
+  
+  if (!sample) {
+    fviz_eig(data.pca, addlabels = TRUE)
+  }
+  
+  pca.loadings <- as_tibble(matrix(as.numeric(loadings), 
+                                   attributes(loadings)$dim, 
+                                   dimnames=attributes(loadings)$dimnames), 
+                            rownames="time") %>% 
+    mutate(time = as.numeric(time)) 
+  
+  pca.loadings <- pca.loadings %>% 
+    rename_with(~ gsub("V", "PC", .))
+  
+  ss_loadings <- colSums(loadings^2)
+  
+  var_explained <- as_tibble(ss_loadings/nrow(loadings)) %>% 
+    mutate(percent_var_explained = value * 100) %>% 
+    add_column(component = pc_names)
+  
+  var_explained <- var_explained %>% 
+    arrange(desc(percent_var_explained)) %>% 
+    mutate(component_renamed = paste("PC", row_number(), sep=""))
+  
+  pca.loadings <- pca.loadings %>% 
+    pivot_longer(cols = pc_names, 
+                 names_to = "component",
+                 values_to = "loading") %>% 
+    left_join(var_explained, by=c("component")) %>% 
+    rename(component_orig = component,
+           component = component_renamed)
+  
+  subj.data.scores <- subj.data %>% 
+    add_column(subj.pred) %>% 
+    pivot_longer(cols = pc_names, 
+                 names_to = "component",
+                 values_to = "component_score") %>% 
+    left_join(var_explained, by=c("component")) %>% 
+    rename(component_orig = component,
+           component = component_renamed)
+  
+  scores <- subj.data.scores %>% 
+    select(subjectId, 
+           trialN, 
+           img,
+           trialN_block,
+           block,
+           trial_outcome, 
+           association_strength,
+           component,
+           component_score)
+  return(list(pca.loadings, subj.data.scores, scores))
+}
+```
+
+
+```{r run_pca, echo=F}
+
+output <- run_tPCA(subj.data, ncomp, sample=F)
+original.loadings <- output[[1]]
+original.scores <- output[[2]]
+scores <- output[[3]]
+
+
+# ordered by "peak time"
+ordered_pcs <- c("PC2",
+                 "PC5",
+                 "PC1",
+                 "PC6",
+                 "PC3",
+                 "PC4")
+
+component_order_with_var_explained <- c("PC2: 25.89%",
+                                        "PC5: 5.66%",
+                                        "PC1: 28.81%",
+                                        "PC6: 1.83%",
+                                        "PC3: 19.29%",
+                                        "PC4: 14.68%")
+```
+
+```{r run_bootstrap, echo=F, eval=T}
+n_samples <- 1000
+
+bootstrap_loadings <- function(data, ncomp, n_samples) {
+  results <- replicate(n_samples, {
+    run_tPCA(data, ncomp, sample=T)[[1]] # just bind loadings, ignore scores
+  }, simplify = FALSE)
+  bind_rows(results, .id = "bootstrapped_sample")
+}
+
+bootstrap.loadings <- bootstrap_loadings(subj.data, ncomp, n_samples)
+
+```
+
+```{r plot_pc_loadings, echo=F}
+
+rainbow <- c("#E82C42", 
+             "#F46D43", 
+             "#FFCC00", 
+             "#29A343", 
+             "#1E8DD2", 
+             "#59169C")
+
+pca.loadings <- original.loadings
+subj.pred <- original.scores
+
+pca.loadings %>% 
+  mutate(component = paste(component, ": ", round(percent_var_explained, 2),
+                           "%",
+                           sep = "")) %>% 
+  ggplot(aes(x = time, 
+             y = loading,
+             color = component,
+             fill = component)) +
+  geom_vline(xintercept = c(0, 1, 2, 2.75),
+             linetype = "dashed",
+             color = "gray37") +
+  geom_line(linewidth=1) +
+  geom_text(aes(label = event,
+                x = time,
+                y = 0.75),
+            data = ret_labels,
+            inherit.aes = FALSE,
+            angle = 90, 
+            hjust = 1,
+            vjust = 1.2,
+            size = 3,
+            colour = "gray37",
+            family = fontfamily) + 
+  labs(x = "Time (s)",
+       y = "PC loading",
+       title = "Components extracted by temporal PCA") +
+  scale_color_manual(values=rainbow, name="")
+
+pca.loadings %>% 
+  mutate(component = paste(component, ": ", round(percent_var_explained, 2),
+                           "%",
+                           sep = "")) %>% 
+  mutate(across(component,
+                factor,
+                levels=component_order_with_var_explained)) %>%
+  ggplot(aes(x = time, 
+             y = loading,
+             color = component,
+             fill = component)) +
+  geom_vline(xintercept = c(0, 1, 2, 2.75),
+             linetype = "dashed",
+             color = "gray37") +
+  geom_line(linewidth=1.2) +
+  geom_text(aes(label = event,
+                x = time,
+                y = 0.9),
+            data = ret_labels,
+            inherit.aes = FALSE,
+            angle = 90, 
+            hjust = 1,
+            vjust = 1.2,
+            size = 6,
+            colour = "gray37",
+            family = fontfamily) + 
+  labs(x = "Time (s)",
+       y = "PC loading",
+       title = "Components extracted by temporal PCA") +
+  scale_color_manual(values=rainbow, name="") +
+  theme(text = element_text(size=15))
+
+pca.loadings %>% 
+  mutate(component = paste(component, ": ", round(percent_var_explained, 2),
+                           "%",
+                           sep = "")) %>% 
+  ggplot(aes(x = time, 
+             y = loading,
+             color = component,
+             fill = component)) +
+  geom_vline(xintercept = c(0, 1, 2, 2.75),
+             linetype = "dashed",
+             color = "gray37") +
+  geom_line(color="black", linewidth=1) +
+  geom_text(aes(label = event,
+                x = time,
+                y = 0.75),
+            data = ret_labels,
+            inherit.aes = FALSE,
+            angle = 90, 
+            hjust = 1,
+            vjust = 1.2,
+            size = 3,
+            colour = "gray37",
+            family = fontfamily) + 
+  facet_wrap(~component) +
+  labs(x = "Time (s)",
+       y = "PC loading",
+       title = "Temporal PCA") +
+  scale_color_brewer(palette="Set2") + 
+  theme(legend.position = "none")
+
+
+```
+
+```{r plot_bootstrap, echo=F, eval=T}
+
+bootstrap.pc.aligned <- bootstrap.loadings %>% 
+  select(-component) %>% 
+  left_join(original.loadings %>% 
+              select(-component_orig) %>% 
+              pivot_wider(id_cols = c("time"),
+                          names_from = c("component"), 
+                          values_from = c("loading")) , 
+            by = c("time"),
+            suffix = c(".bootstrap", ".orig")) %>% 
+  group_by(bootstrapped_sample, component_orig) %>% 
+  mutate(across(starts_with("PC"), 
+                ~ cor(loading, .x, use = "complete.obs"), 
+                .names = "{.col}_corr")) %>% 
+  pivot_longer(cols = ends_with("_corr"), 
+               names_to = "component",
+               values_to = "correlation_coef") %>% 
+  mutate(assigned_to_matching_pc = abs(correlation_coef) > 0.95) %>% 
+  group_by(bootstrapped_sample) %>% 
+  mutate(n_components_assigned = length(unique(assigned_to_matching_pc))) %>% 
+  ungroup() %>%
+  mutate(component_assigned = case_when(assigned_to_matching_pc ~ 
+                                          str_remove(component, paste0("_corr", "$")),
+                                                     .default = NA)) %>% 
+  group_by(bootstrapped_sample, component_orig) %>% 
+  mutate(component_orig_assigned = max(assigned_to_matching_pc)) %>% 
+  dplyr::filter((component_orig_assigned & !is.na(component_assigned)) |
+                  !component_orig_assigned) %>% 
+  ungroup() %>% 
+  group_by(bootstrapped_sample) %>% 
+  dplyr::filter(!component %in% unique(component_assigned)) %>% 
+  ungroup() %>% 
+  group_by(bootstrapped_sample, component) %>% # or component_orig?
+  mutate(is_max_coef = abs(correlation_coef) == max(abs(correlation_coef))) %>% 
+  mutate(component_assigned = case_when(is_max_coef ~ 
+                                          str_remove(component, paste0("_corr", "$")),
+                                                     .default = NA)) %>% 
+  ungroup() %>% 
+  dplyr::filter(!is.na(component_assigned)) %>% 
+  select(-is_max_coef, -component_orig_assigned, -component) %>% 
+  rename(component = component_assigned) %>% 
+  mutate(loading = ifelse(correlation_coef < 0, 
+                          -loading, 
+                          loading)) %>% 
+  select(-starts_with("PC"))
+
+bootstrap.pc.aligned %>% 
+  # average first across time
+  group_by(bootstrapped_sample, component, component_orig) %>% 
+  summarize(correlation_coef = mean(correlation_coef)) %>% 
+  group_by(bootstrapped_sample, component, component_orig) %>% 
+  summarize(n_good_matches = n()) %>% 
+  ggplot(aes(x = component,
+             y = n_good_matches,
+             group = component,
+             color = component)) +
+  stat_summary(fun.data="mean_cl_boot",
+               geom="pointrange", 
+               size = 0.6,
+               position = position_dodge()) + 
+  scale_color_manual(values=rainbow, 
+                     name="")
+
+bootstrap.pc.aligned %>% 
+  # average first across time
+  group_by(bootstrapped_sample, component, component_orig) %>% 
+  summarize(correlation_coef = abs(mean(correlation_coef))) %>% 
+  ggplot(aes(x = correlation_coef,
+             fill = component)) +
+  geom_histogram() + 
+  scale_fill_manual(values=rainbow, 
+                    name="")
+
+
+bootstrap.pc.aligned %>% 
+  # average first across time
+  group_by(bootstrapped_sample, component, component_orig) %>% 
+  summarize(correlation_coef = abs(mean(correlation_coef))) %>% 
+  ggplot(aes(x = component,
+             y = correlation_coef,
+             group = component,
+             color = component)) +
+  stat_summary(fun.data="mean_cl_boot",
+               geom="pointrange", 
+               size = 0.6,
+               position = position_dodge()) +
+  scale_color_manual(values=rainbow, 
+                     name="")
+
+bootstrap.summary <- bootstrap.pc.aligned %>% 
+  group_by(component, time) %>% 
+  summarize(upper_ci = quantile(loading, 0.975),
+            lower_ci = quantile(loading, 0.025)) %>% 
+  left_join(original.loadings, 
+            by = c("component", "time"),
+            suffix = c(".bootstrap", ".orig"))
+
+
+bootstrap.summary %>% 
+  ggplot(aes(x = time, 
+             fill = component)) +
+  geom_ribbon(aes(ymin = lower_ci, 
+                  ymax = upper_ci),
+              alpha = 0.3) +
+  geom_vline(xintercept = c(0, 1, 2, 2.75),
+             linetype = "dashed",
+             color = "gray37") +
+  geom_line(aes(y=loading,
+                color=component),
+            linewidth=1) +
+  geom_text(aes(label = event,
+                x = time,
+                y = 0.75),
+            data = ret_labels,
+            inherit.aes = FALSE,
+            angle = 90, 
+            hjust = 1,
+            vjust = 1.2,
+            size = 3,
+            colour = "gray37",
+            family = fontfamily) + 
+  labs(x = "Time (s)",
+       y = "PC loading",
+       title = "Components extracted by temporal PCA") +
+  scale_color_manual(values=rainbow, name="") + 
+  scale_fill_manual(values=rainbow, 
+                    name="")
+
+bootstrap.summary %>%
+  mutate(component = paste(component, ": ", round(percent_var_explained, 2),
+                           "%",
+                           sep = "")) %>% 
+  mutate(component = factor(component,
+                            levels=component_order_with_var_explained)) %>%
+  ggplot(aes(x = time,
+             y = loading,
+             fill = component)) +
+  geom_ribbon(aes(ymin = lower_ci, 
+                  ymax = upper_ci),
+              alpha = 0.3) +
+  geom_vline(xintercept = c(0, 1, 2, 2.75),
+             linetype = "dashed",
+             color = "gray37") +
+  geom_line(aes(color=component),
+            linewidth=1.2) +
+  geom_text(aes(label = event,
+                x = time,
+                y = 0.9),
+            data = ret_labels,
+            inherit.aes = FALSE,
+            angle = 90,
+            hjust = 1,
+            vjust = 1.2,
+            size = 6,
+            colour = "gray37",
+            family = fontfamily) +
+  labs(x = "Time (s)",
+       y = "PC loading",
+       title = "Components extracted by temporal PCA") +
+  scale_color_manual(values=rainbow, name="") +
+  scale_fill_manual(values=rainbow, name="") +
+  theme(text = element_text(size=15))
+
+bootstrap.summary %>%
+  mutate(component = paste(component, ": ", round(percent_var_explained, 2),
+                           "%",
+                           sep = "")) %>%
+  ggplot(aes(x = time,
+             y = loading)) +
+  geom_vline(xintercept = c(0, 1, 2, 2.75),
+             linetype = "dashed",
+             color = "gray37") +
+  geom_ribbon(aes(ymin = lower_ci, 
+                  ymax = upper_ci),
+              alpha = 0.5,
+              fill = "gray36") +
+  geom_line(color="black", linewidth=1) +
+  geom_text(aes(label = event,
+                x = time,
+                y = 0.75),
+            data = ret_labels,
+            inherit.aes = FALSE,
+            angle = 90,
+            hjust = 1,
+            vjust = 1.2,
+            size = 3,
+            colour = "gray37",
+            family = fontfamily) +
+  facet_wrap(~component) +
+  labs(x = "Time (s)",
+       y = "PC loading",
+       title = "Temporal PCA") +
+  scale_color_brewer(palette="Set2") +
+  theme(legend.position = "none")
+
+
+```
+
+
+### Identify peaks
+
+```{r peak_times, echo=F, eval=T}
+
+peak_indices <- pca.loadings %>% 
+  group_by(component) %>% 
+  arrange(time) %>% 
+  summarize(peak_info = pracma::findpeaks(loading, 
+                                          nups = 1, 
+                                          ndowns = 1, 
+                                          threshold = 0, 
+                                          npeaks = 3,
+                                          sortstr = TRUE),
+            peak_times = peak_info[,2],
+            peak_start = peak_info[,3],
+            peak_end = peak_info[,4]) %>% 
+  select(-peak_info) %>% 
+  ungroup() %>%
+  mutate(is_peak = T)
+
+
+peak_times <- pca.loadings %>% 
+  group_by(component) %>% 
+  arrange(time) %>% 
+  mutate(peak_times = row_number()) %>% 
+  ungroup() %>% 
+  left_join(peak_indices) %>% 
+  group_by(component, is_peak, time) %>% 
+  dplyr::filter(is_peak) %>% 
+  summarize() %>% 
+  mutate(peak_time = time) %>% 
+  group_by(component, is_peak) %>% 
+  mutate(peak_number = row_number()) %>% 
+  ungroup()
+
+
+peak_start_times <- pca.loadings %>% 
+  group_by(component) %>% 
+  arrange(time) %>% 
+  mutate(peak_start = row_number()) %>% 
+  ungroup() %>% 
+  left_join(peak_indices) %>% 
+  group_by(component, is_peak, time) %>% 
+  dplyr::filter(is_peak) %>% 
+  summarize() %>% 
+  mutate(peak_start_time = time) %>% 
+  group_by(component, is_peak) %>% 
+  mutate(peak_number = row_number()) %>% 
+  ungroup()
+
+peak_end_times <- pca.loadings %>% 
+  group_by(component) %>% 
+  arrange(time) %>% 
+  mutate(peak_end = row_number()) %>% 
+  ungroup() %>% 
+  left_join(peak_indices) %>% 
+  group_by(component, is_peak, time) %>% 
+  dplyr::filter(is_peak) %>% 
+  summarize() %>% 
+  mutate(peak_end_time = time) %>% 
+  group_by(component, is_peak) %>% 
+  mutate(peak_number = row_number()) %>% 
+  ungroup()
+
+peak_times %>% 
+  left_join(peak_start_times 
+            %>% select(-time)) %>% 
+  left_join(peak_end_times %>% 
+              select(-time)) %>% 
+  select(-is_peak) %>% 
+  left_join(pca.loadings %>% 
+              select(component, time, loading)) %>% 
+  select(component, 
+         peak_number, 
+         peak_time, 
+         peak_start_time, 
+         peak_end_time, 
+         loading) %>% 
+  kable(caption="Peak information",
+        digits=3) %>%
+  kable_styling()
+
+pca.loadings.peaks <- pca.loadings %>% 
+  left_join(peak_times %>% 
+              select(component, time, peak_time, peak_number)) %>% 
+  left_join(peak_start_times %>% 
+              select(component, time, peak_start_time, peak_number),
+            by = c("component", "time"),
+            suffix = c("", ".start")) %>% 
+  left_join(peak_end_times %>% 
+              select(component, time, peak_end_time, peak_number),
+            by = c("component", "time"),
+            suffix = c("", ".end"))
+
+# plot PC5 dip loading
+pc5.loadings <- pca.loadings.peaks %>% 
+  dplyr::filter(component == "PC5")
+
+pc5.loadings %>% 
+  dplyr::filter(!is.na(peak_end_time)) %>% 
+  select(peak_end_time, loading) %>% 
+  kable(caption="PC5", digits=3) %>% 
+  kable_styling()
+
+pc5.loadings %>% 
+  mutate(diff.loading = c(NA, diff(sign(loading)))) %>% 
+  dplyr::filter(diff.loading != 0 & !(is.na(diff.loading))) %>% 
+  select(time, loading, diff.loading) %>% 
+  kable(caption = "PC5: where the loading changes sign", digits=3) %>% 
+  kable_styling()
+
+pc5.auc.pos <- trapz(pc5.loadings$time, 
+                     pc5.loadings %>%
+                       mutate(loading = ifelse(loading < 0,
+                                               0,
+                                               loading)) %>% 
+                       pull(loading))
+
+pc5.auc.neg <- trapz(pc5.loadings$time, 
+                     pc5.loadings %>%
+                       mutate(loading = ifelse(loading < 0,
+                                               loading * -1,
+                                               0)) %>% 
+                       pull(loading))
+
+# plot PC6 dip loading
+pc6.loadings <- pca.loadings.peaks %>% 
+  dplyr::filter(component == "PC6")
+
+pc6.auc.pos <- trapz(pc6.loadings$time, 
+                     pc6.loadings %>%
+                       mutate(loading = ifelse(loading < 0,
+                                               0,
+                                               loading)) %>% 
+                       pull(loading))
+
+pc6.auc.neg <- trapz(pc6.loadings$time, 
+                     pc6.loadings %>%
+                       mutate(loading = ifelse(loading < 0,
+                                               loading * -1,
+                                               0)) %>% 
+                       pull(loading))
+
+pc6.loadings %>% 
+  dplyr::filter(!is.na(peak_end_time)) %>% 
+  select(peak_end_time, loading) %>% 
+  kable(caption="PC6", digits=3) %>% 
+  kable_styling()
+
+pc6.loadings %>% 
+  mutate(diff.loading = c(NA, diff(sign(loading)))) %>% 
+  dplyr::filter(diff.loading != 0 & !(is.na(diff.loading))) %>% 
+  select(time, loading, diff.loading) %>% 
+  kable(caption = "PC6: where the loading changes sign", digits=3) %>% 
+  kable_styling()
+
+pca.loadings %>% 
+  left_join(peak_times %>% 
+              select(component, time, peak_time, peak_number)) %>% 
+  left_join(peak_start_times %>% 
+              select(component, time, peak_start_time, peak_number),
+            by = c("component", "time"),
+            suffix = c("", ".start")) %>% 
+  left_join(peak_end_times %>% 
+              select(component, time, peak_end_time, peak_number),
+            by = c("component", "time"),
+            suffix = c("", ".end")) %>% 
+  mutate(component = paste(component, ": ", round(percent_var_explained, 2),
+                           "%",
+                           sep = "")) %>% 
+  ggplot(aes(x = time, 
+             y = loading,
+             color = component,
+             fill = component)) +
+  geom_vline(xintercept = c(0, 1, 2, 2.75),
+             linetype = "dashed",
+             color = "gray37") +
+  geom_line(color="black", linewidth=1) +
+  geom_point(aes(x = peak_time, 
+                 y = 1,
+                 color = as.factor(peak_number)),
+             shape = 8) +
+  geom_point(aes(x = peak_start_time, 
+                 y = 0.5,
+                 color = as.factor(peak_number.start)),
+             shape = 3) +
+  geom_point(aes(x = peak_end_time, 
+                 y = 0.5,
+                 color = as.factor(peak_number.end)),
+             shape = 4) +
+  geom_text(aes(label = event,
+                x = time,
+                y = 0.75),
+            data = ret_labels,
+            inherit.aes = FALSE,
+            angle = 90, 
+            hjust = 1,
+            vjust = 1.2,
+            size = 3,
+            colour = "gray37",
+            family = fontfamily) + 
+  facet_wrap(~component) +
+  labs(x = "Time (s)",
+       y = "PC loading",
+       title = "Temporal PCA") +
+  theme(legend.position = "none")
+
+```
+
+### FWHM
+
+```{r fwhm, echo=F}
+
+peak_times <- peak_times %>% 
+  select(-time) %>%
+  left_join(peak_start_times %>% 
+              select(-time), 
+            by=c("component", 
+                 "peak_number",
+                 "is_peak"),
+            suffix = c(".peak", ".start")) %>% 
+  left_join(peak_end_times %>% 
+              select(-time), 
+            by=c("component", 
+                 "peak_number",
+                 "is_peak"),
+            suffix = c(".peak", ".end"))
+
+loadings.fwhm <- pca.loadings %>% 
+  left_join(peak_times,
+            by = "component",
+            relationship = "many-to-many") %>% 
+  dplyr::filter(time >= peak_start_time & time <= peak_end_time) %>% 
+  group_by(component, peak_number) %>% 
+  summarize(pc.fwhm = fwhm(time, loading, ref="max")) %>% 
+  ungroup() 
+
+loadings.fwhm %>% 
+  mutate(peak_number = as.character(peak_number)) %>% 
+  ggplot(aes(y = peak_number,
+             x = pc.fwhm,
+             fill = component)) +
+  geom_bar(stat='identity',
+           position=position_dodge()) +
+  scale_color_manual(values=rainbow, name="") + 
+  scale_fill_manual(values=rainbow, name="") + 
+  labs(x = "FWHM (s)",
+       y = "") +
+  facet_wrap(~component)
+
+
+loadings.fwhm %>% 
+  ggplot(aes(y = component,
+             x = pc.fwhm,
+             color = component)) +
+  stat_summary(fun.data="mean_cl_boot",
+               geom="pointrange", 
+               size = 0.6,
+               fill = "white",
+               shape = 23,
+               position = position_dodge()) +
+  scale_color_manual(values=rainbow, name="") + 
+  scale_fill_manual(values=rainbow, name="") + 
+  labs(x = "FWHM (s)",
+       y = "") +
+  facet_wrap(~peak_number)
+
+loadings.fwhm %>% 
+  kable(digits=2) %>% 
+  kable_styling()
+
+```
+
+
+### Bootstrapped peaks
+
+```{r peak_times_bootstrap, echo=F, eval=T}
+
+peak_indices <- bootstrap.pc.aligned %>% 
+  group_by(bootstrapped_sample, component) %>% 
+  arrange(time) %>% 
+  summarize(peak_info = pracma::findpeaks(loading, 
+                                          nups = 1, 
+                                          ndowns = 1, 
+                                          threshold = 0, 
+                                          npeaks = 3,
+                                          sortstr = TRUE),
+            peak_times = peak_info[,2],
+            peak_start = peak_info[,3],
+            peak_end = peak_info[,4]) %>% 
+  select(-peak_info) %>%
+  ungroup() %>%
+  mutate(is_peak = T)
+
+
+peak_times <- bootstrap.pc.aligned %>% 
+  group_by(bootstrapped_sample, component) %>% 
+  arrange(time) %>% 
+  mutate(peak_times = row_number()) %>% 
+  ungroup() %>% 
+  left_join(peak_indices) %>% 
+  group_by(bootstrapped_sample, component, is_peak, time) %>% 
+  dplyr::filter(is_peak) %>% 
+  summarize(peak_time = first(time),
+            loading_at_peak = first(loading)) %>% 
+  group_by(bootstrapped_sample, component, is_peak) %>% 
+  mutate(peak_number = row_number()) %>% 
+  ungroup()
+
+
+peak_start_times <- bootstrap.pc.aligned %>% 
+  group_by(bootstrapped_sample, component) %>% 
+  arrange(time) %>% 
+  mutate(peak_start = row_number()) %>% 
+  ungroup() %>% 
+  left_join(peak_indices) %>% 
+  group_by(bootstrapped_sample, component, is_peak, time) %>% 
+  dplyr::filter(is_peak) %>% 
+  summarize() %>% 
+  mutate(peak_start_time = time) %>% 
+  group_by(bootstrapped_sample, component, is_peak) %>% 
+  mutate(peak_number = row_number()) %>% 
+  ungroup()
+
+peak_end_times <- bootstrap.pc.aligned %>% 
+  group_by(bootstrapped_sample, component) %>% 
+  arrange(time) %>% 
+  mutate(peak_end = row_number()) %>% 
+  ungroup() %>% 
+  left_join(peak_indices) %>% 
+  group_by(bootstrapped_sample, component, is_peak, time) %>% 
+  dplyr::filter(is_peak) %>% 
+  summarize() %>% 
+  mutate(peak_end_time = time) %>% 
+  group_by(bootstrapped_sample, component, is_peak) %>% 
+  mutate(peak_number = row_number()) %>% 
+  ungroup()
+
+peak_times %>% 
+  group_by(bootstrapped_sample, component) %>% 
+  summarize(n_peaks = n()) %>% 
+  group_by(component) %>% 
+  summarize(mean_n_peaks = mean(n_peaks)) %>% 
+  kable() %>% 
+  kable_styling()
+
+peak_times %>% 
+  group_by(bootstrapped_sample, component) %>% 
+  summarize(n_peaks = n()) %>% 
+  ggplot(aes(x = component, y=n_peaks)) +
+  stat_summary(fun.data="mean_cl_boot",
+               geom="pointrange",
+               size = 0.6,
+               position = position_dodge(.9))
+
+```
+
+It is possible for each bootstrapped sample to have a different number of peaks. In the code used to generate the tables below, this potential difference is accounted for manually. For the following tables, the number of samples for the main peaks should equal the number of bootstrapping iterations. If that's not the case, something is wrong. For the non-main peaks, the number of samples that contained those extra peaks can be examined.
+
+```{r, echo=F}
+
+peak_times.clean <- peak_times %>% 
+  group_by(component, bootstrapped_sample) %>% 
+  mutate(is_last_peak = peak_number == max(peak_number),
+         is_first_peak = peak_number == min(peak_number)) %>% 
+  ungroup() %>% 
+  mutate(peak_type = case_when(
+    (component == "PC1" & is_first_peak) ~ "main peak",
+    (component == "PC2" & is_first_peak) ~ "main peak",
+    (component == "PC3" & is_last_peak) ~ "main peak",
+    (component == "PC4" & is_last_peak) ~ "main peak",
+    (component == "PC5" & is_first_peak) ~ "main peak",
+    (component == "PC6") ~ paste("main peak", peak_number),  
+    TRUE ~ as.character(peak_number) 
+  )) %>% 
+  mutate(across(peak_type,
+                factor,
+                levels = c("main peak",
+                           "main peak 1",
+                           "main peak 2",
+                           "main peak 3",
+                           "1",
+                           "2",
+                           "3")))
+
+# bootstrap.pc.aligned %>%
+#   mutate(bootstrapped_sample = as.numeric(bootstrapped_sample)) %>% 
+#   dplyr::filter(bootstrapped_sample == 10) %>% 
+#     ggplot(aes(x=time,
+#                y=loading,
+#                group=bootstrapped_sample,
+#                color=bootstrapped_sample)) +
+#     geom_line() +
+#     facet_wrap(~component)
+
+peak_times.clean %>% 
+  left_join(peak_start_times 
+            %>% select(-time)) %>% 
+  left_join(peak_end_times %>% 
+              select(-time)) %>% 
+  select(-is_peak) %>% 
+  left_join(bootstrap.pc.aligned %>% 
+              select(bootstrapped_sample, component, time, loading)) %>%
+  group_by(component, 
+           peak_type) %>% 
+  summarise(across(c(peak_time, 
+                     peak_start_time, 
+                     peak_end_time, 
+                     loading),
+                   list(lower = ~ quantile(.x, 0.025),
+                        upper = ~ quantile(.x, 0.975)),
+                   .names = "{.col}_{.fn}"),
+            n = n()) %>%
+  mutate(peak_time_ci = sprintf("[%.3f, %.3f]", 
+                                peak_time_lower, 
+                                peak_time_upper),
+         peak_start_time_ci = sprintf("[%.3f, %.3f]", 
+                                      peak_start_time_lower, 
+                                      peak_start_time_upper),
+         peak_end_time_ci = sprintf("[%.3f, %.3f]", 
+                                    peak_end_time_lower, 
+                                    peak_end_time_upper),
+         peak_loading_ci = sprintf("[%.3f, %.3f]", 
+                                   loading_lower, 
+                                   loading_upper)) %>% 
+  select(component, 
+         peak_type, 
+         peak_time_ci, 
+         peak_start_time_ci, 
+         peak_end_time_ci, 
+         peak_loading_ci,
+         n) %>% 
+  arrange(peak_type, component) %>% 
+  kable(caption="Bootstrapped 95% CIs for peaks and time to peak",
+        digits=3) %>%
+  kable_styling()
+
+peak_times.clean %>% 
+  left_join(peak_start_times 
+            %>% select(-time)) %>% 
+  left_join(peak_end_times %>% 
+              select(-time)) %>% 
+  select(-is_peak, -time) %>% 
+  right_join(bootstrap.pc.aligned %>% 
+               select(bootstrapped_sample, component, time, loading),
+             by = c("component", "bootstrapped_sample"),
+             relationship = "many-to-many") %>%
+  group_by(bootstrapped_sample,
+           component, 
+           peak_type) %>% 
+  dplyr::filter(time >= peak_start_time & time <= peak_end_time) %>%
+  summarize(pc.fwhm = fwhm(time, loading, ref="max")) %>% 
+  group_by(component, 
+           peak_type) %>% 
+  summarise(across(c(pc.fwhm),
+                   list(lower = ~ quantile(.x, 0.025),
+                        upper = ~ quantile(.x, 0.975)),
+                   .names = "{.col}_{.fn}"),) %>%
+  mutate(peak_fwhm_ci = sprintf("[%.3f, %.3f]", 
+                                pc.fwhm_lower, 
+                                pc.fwhm_upper)) %>% 
+  select(component, 
+         peak_type, 
+         peak_fwhm_ci) %>% 
+  arrange(peak_type, component) %>% 
+  kable(caption="Bootstrapped 95% CIs for FWHM",
+        digits=3) %>%
+  kable_styling()
+```

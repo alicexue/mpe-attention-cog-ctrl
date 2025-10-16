@@ -1,0 +1,1328 @@
+---
+title: "EEG power and subsequent memory"
+author: "Alice M. Xue (alicexue@stanford.edu)"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+params:
+    power_name: "frontal-theta"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 3
+    toc_float:
+      collapsed: no
+    self_contained: yes
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+    self_contained: yes
+---
+
+```{r setup, include=FALSE}
+library(plyr)
+library(tidymv)
+library(Hmisc)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+library(data.table)
+library(psycho)
+library(lme4)
+library(sjPlot)
+library(afex)
+library(wesanderson)
+library(viridis)
+library(showtext)
+library(tidyverse)
+library(mgcv)
+library(itsadug)
+library(RColorBrewer)
+library(ggcorrplot)
+library(devtools)
+library(factoextra)
+library(tidyjson)
+library(purrr)
+library(broom)
+library(zoo)
+library(psych)
+library(patchwork)
+library(emmeans)
+library(ggpubr)
+library(stats)
+library(broom.mixed)
+library(fuzzyjoin)
+library(sjlabelled)
+
+font_add(family = "Avenir Next",
+         regular = "../utils/AvenirNext-Regular.ttf",
+         bold = "../utils/AvenirNext-DemiBold.ttf",
+         italic = "../utils/AvenirNext-Italic.ttf")
+showtext.auto()
+op <- showtext_opts()
+
+fontfamily <- "Avenir Next"
+
+set_theme(
+  base=theme_classic(base_size = 12,
+                     base_family="Avenir Next",
+                     base_line_size = 12/30,
+                     base_rect_size = 12/30)
+)
+
+options(dplyr.summarise.inform = FALSE)
+
+knitr::opts_chunk$set(echo = TRUE, 
+                      warning=FALSE, 
+                      message = FALSE, 
+                      fig.showtext=TRUE)
+
+# knitr::opts_chunk$set(dev = 'pdf') # set output device to pdf
+
+source("../utils/summary_se_utils.R")
+```
+
+```{r get_behavior, echo=F}
+set.seed(478)
+
+power_name <- params$power_name
+
+stopifnot(power_name %in% c("frontal-theta", "posterior-alpha"))
+
+if (power_name == "frontal-theta") {
+  power <- fread("../../data/eeg/MPE_frontal_theta_asso_retrieval_CR.csv")
+  y_axis_power_label = "Frontal theta"
+} else if (power_name == "posterior-alpha") {
+  power <- fread("../../data/eeg/MPE_posterior_alpha_asso_retrieval_CR.csv")
+  y_axis_power_label = "Posterior alpha"
+}
+
+data_recog <- fread("../../data/behavior/MPE_mismatch_recog_behavior.csv") %>% 
+  mutate(rt = recognition_response.rt * 1000)
+
+greek.beta <- "\u03B2"
+```
+
+
+```{r labels, echo=F}
+palette <- c("#59735e", "#b7c8ba")
+hit_miss_palette <- c("#6E9075", "#FC7753")
+submem.beta_palette <- c("#A7A2A9", "#9C528B", "#1A936F", "#190E4F")
+
+sfreq <- 0.008
+
+ret_labels_strong <- tibble(event = c("cue", "delay", "probe", "ITI"),
+                            time = c(0, 1, 2, 2.75))
+
+ret_labels_weak <- tibble(event = c("cue", "delay", "probe", "ITI"),
+                          time = c(0, 1, 2, 2.75))
+
+ret_labels <- rbind(ret_labels_strong, ret_labels_weak)
+
+if (power_name == "frontal-theta") {
+  ret_labels$position <- 0.8
+} else if (power_name == "posterior-alpha") {
+  ret_labels$position <- 0.6
+  ret_labels$position.itc <- 0
+}
+
+if (power_name == "frontal-theta") {
+  ymin.power <- -0.5
+  ymax.power <- 0.8
+} else if (power_name == "posterior-alpha") {
+  ymin.power <- -0.6
+  ymax.power <- 0.6
+}
+
+recognition_behavior <- data_recog %>%
+  mutate(trialN = trials.thisTrialN,
+         participant_id = subjectId) %>% 
+  select(trialN,
+         recognition_response.keys,
+         recognition_response.rt,
+         is_old,
+         img,
+         participant_id) %>%
+  mutate(hit = is_old & (recognition_response.keys==1)) %>%
+  mutate(false_alarm = !is_old & (recognition_response.keys==1)) %>%
+  mutate(miss = is_old & (recognition_response.keys==2)) %>%
+  mutate(correct_rejection = !is_old & (recognition_response.keys==2)) %>%
+  mutate(trial_outcome = case_when(hit ~ "Hit",
+                                   false_alarm ~ "FA",
+                                   miss ~ "Miss",
+                                   correct_rejection ~ "CR")) %>%
+  group_by(participant_id,
+           trialN,
+           trial_outcome,
+           is_old,
+           img,
+           recognition_response.keys) %>%
+  summarize(recognition_response.rt = mean(recognition_response.rt)) %>%
+  ungroup() 
+
+```
+
+# Power time series
+
+```{r mean_time_series, echo=F}
+power.submem <- power %>%
+  mutate(hit = is_match_trial & (match_response.keys==1)) %>%
+  mutate(false_alarm = !is_match_trial & (match_response.keys==1)) %>%
+  mutate(miss = is_match_trial & (match_response.keys==2)) %>%
+  mutate(correct_rejection = !is_match_trial & (match_response.keys==2)) %>%
+  mutate(customlinetype = ifelse(hit | correct_rejection,
+                                 0,
+                                 1)) %>% 
+  mutate(trial_outcome = case_when(hit ~ "Match",
+                                   false_alarm ~ "False alarm (mismatch)",
+                                   miss ~ "Miss (match)",
+                                   correct_rejection ~ "Mismatch")) %>%
+  dplyr::filter(correct_rejection) %>% 
+  dplyr::filter(!is.na(match_response.rt)) %>%  
+  dplyr::filter(trial_outcome %in% c("Match", "False alarm (mismatch)", "Miss (match)", "Mismatch")) %>% 
+  mutate(img = probe) %>% 
+  group_by(time,
+           subjectId,
+           association_strength,
+           customlinetype,
+           img,
+           trial_outcome) %>% 
+  summarize(power = mean(power)) %>% 
+  ungroup() 
+
+
+power.submem <- power.submem %>% 
+  left_join(recognition_behavior %>% 
+              mutate(subjectId = participant_id), 
+            by=c("subjectId", "img"),
+            suffix = c(".ret", ".recog")) %>% 
+  dplyr::filter(!is.na(trial_outcome.recog))
+
+
+power.summarized <- power.submem %>% 
+  group_by(time,
+           subjectId,
+           association_strength,
+           trial_outcome.recog) %>% 
+  summarize(power = mean(power)) %>% 
+  ungroup() 
+
+```
+
+```{r submem_time_series_, echo=F, fig.width=7, fig.height=2.5}
+
+submem.exclude.subs <- c("MPE106", "MPE112", "MPE126", "MPE134", "MPE138", "MPE141", "MPE142")
+
+power.submem <- power.submem %>% 
+  dplyr::filter(!(subjectId %in% submem.exclude.subs))
+```
+
+## Betas
+
+```{r get_betas, echo=F}
+compute_betas <- T
+
+if (file.exists(paste("power", power_name, "submem_betas.RData", sep="_"))) {
+  load(paste("power", power_name, "submem_betas.RData", sep="_"))
+}
+
+if (compute_betas) {
+  power.betas <- power.submem %>%
+    mutate(is_incorrect = if_else(trial_outcome.recog %in% c("Hit"),
+                                  0,
+                                  1)) %>% 
+    group_by(subjectId, time) %>% 
+    group_modify(~ tidy(lm(power ~ association_strength * is_incorrect, 
+                           data = .x)))
+}
+```
+
+```{r plot_betas, echo=F, fig.width=4, fig.height=7}
+betas.df <- power.betas %>% 
+  group_by(time, term) %>% 
+  summarize(se = sd(estimate) / sqrt(sum(!is.na(estimate))),
+            estimate = mean(estimate)) %>% 
+  ungroup() %>% 
+  mutate(term = case_when(term == "association_strengthWeak (1x)" ~ "Memory strength (Weak v. Strong)",
+                          term == "association_strengthWeak (1x):is_incorrect" ~ "Memory outcome x Memory strength",
+                          term == "is_incorrect" ~ "Subsequent Miss v. Hit",
+                          term == "(Intercept)" ~ "Intercept",
+                          .default="")) %>% 
+  dplyr::filter(term != "") %>% 
+  mutate(across(term,
+                factor,
+                levels = c("Intercept",
+                           "Subsequent Miss v. Hit",
+                           "Memory strength (Weak v. Strong)",
+                           "Memory outcome x Memory strength")))
+
+results.betas <- power.betas %>% 
+  group_by(time, term) %>% 
+  summarise(t_test = list(t.test(estimate))) %>%
+  mutate(
+    t_statistic = sapply(t_test, function(x) x$statistic),
+    p_value = sapply(t_test, function(x) x$p.value),
+    conf_int_lower = sapply(t_test, function(x) x$conf.int[1]),
+    conf_int_upper = sapply(t_test, function(x) x$conf.int[2])
+  ) %>%
+  select(-t_test) %>% 
+  mutate(p.adj = p_value) %>% 
+  ungroup()
+
+if (power_name == "frontal-theta") {
+  results.betas <- results.betas %>%
+    mutate(ypos = case_when(term == "association_strengthWeak (1x)" ~ -0.85,
+                            term == "association_strengthWeak (1x):is_incorrect" ~ -0.2,
+                            term == "is_incorrect" ~ -0.6,
+                            .default=0))
+} else if (power_name == "posterior-alpha") {
+  results.betas <- results.betas %>%
+    mutate(ypos = case_when(term == "association_strengthWeak (1x)" ~ -0.18,
+                            term == "association_strengthWeak (1x):is_incorrect" ~ -0.55,
+                            term == "is_incorrect" ~ -0.3,
+                            .default=0))
+}
+
+results.betas <- results.betas %>%
+  dplyr::filter(p.adj < 0.05) %>% 
+  mutate(term = case_when(term == "association_strengthWeak (1x)" ~ "Memory strength (Weak v. Strong)",
+                          term == "association_strengthWeak (1x):is_incorrect" ~ "Memory outcome x Memory strength",
+                          term == "is_incorrect" ~ "Subsequent Miss v. Hit",
+                          .default="")) %>% 
+  dplyr::filter(term != "") %>% 
+  mutate(across(term,
+                factor,
+                level=c("Subsequent Miss v. Hit",
+                        "Memory strength (Weak v. Strong)",
+                        "Memory outcome x Memory strength")))
+
+clusters <- results.betas %>% 
+  group_by(term) %>% 
+  mutate(time_diff = c(NA, diff(time))) %>% 
+  mutate(time_diff_back = lead(time_diff)) %>% 
+  mutate(time_diff = round(time_diff, 3),
+         time_diff_back = round(time_diff_back, 3)) %>% 
+  dplyr::filter(time_diff > sfreq | time_diff_back > sfreq | is.na(time_diff) | is.na(time_diff_back)) %>% 
+  ungroup() %>% 
+  select(term, time, time_diff, time_diff_back) %>% 
+  arrange(term, time) %>% 
+  dplyr::filter(time_diff_back == sfreq | time_diff == sfreq) %>% 
+  mutate(is_solo_point = ifelse(is.na(time_diff) & time_diff_back > sfreq, T, F)) %>% 
+  group_by(term, is_solo_point) %>% 
+  mutate(index_parity = if_else(row_number() %% 2 == 1, "start", "end")) %>% 
+  mutate(time_period = round(row_number()+1/2) / 2) %>% 
+  ungroup() %>% 
+  select(-time_diff, -time_diff_back) %>% 
+  pivot_wider(names_from=c("index_parity"),
+              values_from = "time") %>% 
+  select(-time_period, -is_solo_point) %>% 
+  mutate(cluster_size = end-start) %>% 
+  mutate(cluster_id = row_number())
+
+cluster_beta_means <- fuzzy_left_join(
+  power.betas %>% 
+    mutate(term = case_when(term == "association_strengthWeak (1x)" ~ "Memory strength (Weak v. Strong)",
+                            term == "association_strengthWeak (1x):is_incorrect" ~ "Memory outcome x Memory strength",
+                            term == "is_incorrect" ~ "Subsequent Miss v. Hit",
+                            .default="")), 
+  clusters %>% 
+    mutate(term = as.character(term)) %>% 
+    rename(cluster.term = term),
+  by = c("time" = "start", "time" = "end", "term" = "cluster.term"),
+  match_fun = list(`>=`, `<=`, `==`)
+) %>% 
+  dplyr::filter(!is.na(cluster_id))
+
+clusters %>% 
+  left_join(
+    cluster_beta_means %>% 
+      group_by(subjectId, cluster_id) %>% 
+      summarize(beta = mean(estimate)) %>% 
+      group_by(cluster_id) %>% 
+      summarize(mean_beta = mean(beta),
+                se = sd(beta) / sqrt(n()),
+                lower_ci = mean_beta - 1.96 * se,
+                upper_ci = mean_beta + 1.96 * se
+      ) %>% 
+      select(-se), 
+    by = "cluster_id") %>% 
+  kable(digits=3) %>% 
+  kable_styling()
+
+if (power_name == "frontal-theta") {
+  beta.event.y <- 0.5
+} else if (power_name == "posterior-alpha") {
+  beta.event.y <- 0.4
+}
+
+```
+
+```{r beta_joint_plt, echo=F, fig.width=4, fig.height=8}
+timeseries.plt <- power.summarized %>% 
+  summarySEwithin(.,
+                  measurevar="power",
+                  withinvars=c("association_strength",
+                               "trial_outcome.recog",
+                               "time"),
+                  idvar="subjectId") %>%
+  ggplot(aes(x = as.numeric(as.character(time)), 
+             y = power,
+             color = trial_outcome.recog,
+             fill = trial_outcome.recog)) +
+  geom_ribbon(aes(ymin=power-se, ymax=power+se),
+              color=NA,
+              alpha=0.3) +
+  geom_line(linewidth = 1) +
+  geom_vline(xintercept = c(0, 1, 2, 2.75),
+             linetype = "dashed",
+             color = "gray37") +
+  labs(x = "Time (s)",
+       y = paste(y_axis_power_label, "(z)", sep=" "),
+       title = "") +
+  facet_grid(cols=vars(association_strength)) +
+  # geom_text(aes(label = event,
+  #               x = time,
+  #               y = position),
+  #           data = ret_labels,
+  #           inherit.aes = FALSE,
+  #           angle = 90,
+  #           hjust = 1,
+  #           vjust = 1.3,
+  #           size = 3.5,
+  #           colour = "gray37",
+  #           family = fontfamily) +
+  guides(linetype = "none") + 
+  scale_color_manual(values=hit_miss_palette, name="") + 
+  scale_fill_manual(values=hit_miss_palette, name="") + 
+  theme(strip.text.x = element_text(size=12))
+
+```
+
+```{r, echo=F, fig.width=8}
+
+beta.no.intercept.plt <- betas.df %>% 
+  dplyr::filter(term != "Intercept") %>% 
+  ggplot(aes(x=as.numeric(as.character(time)), 
+             y=estimate,
+             color=term,
+             fill=term)) + 
+  geom_ribbon(aes(ymin=estimate-se, ymax=estimate+se),
+              color=NA,
+              alpha=0.3) +
+  geom_line(linewidth = 1) +
+  geom_vline(xintercept = c(0, 1, 2, 2.75),
+             linetype = "dashed",
+             color = "gray37") +
+  geom_hline(yintercept = c(0),
+             linetype = "longdash",
+             color = "gray37") +
+  # mark significant difference
+  geom_point(aes(x = time,
+                 y = ypos,
+                 color=term),
+             show.legend = F,
+             data = results.betas,
+             size = 0.3) +
+  labs(x = "Time (s)",
+       y = paste(y_axis_power_label, greek.beta, "weights (a.u.)", sep=" "),
+       title = "") +
+  geom_text(aes(label = event,
+                x = time,
+                y = beta.event.y),
+            data = ret_labels,
+            inherit.aes = FALSE,
+            angle = 90, 
+            hjust = 1,
+            vjust = 1.3,
+            size = 3.5,
+            colour = "gray37",
+            family = fontfamily) + 
+  guides(color="none",
+         fill="none") + 
+  facet_wrap(~term, ncol=1, scales="free_y", strip.position="top") +
+  scale_color_manual(values=submem.beta_palette[2:4], name="") + 
+  scale_fill_manual(values=submem.beta_palette[2:4], name="") + 
+  theme(strip.text.x = element_text(size=12),
+        plot.title = element_blank())
+
+timeseries.plt <- power.summarized %>% 
+  summarySEwithin(.,
+                  measurevar="power",
+                  withinvars=c("association_strength",
+                               "trial_outcome.recog",
+                               "time"),
+                  idvar="subjectId") %>%
+  ggplot(aes(x = as.numeric(as.character(time)), 
+             y = power,
+             color = trial_outcome.recog,
+             fill = trial_outcome.recog)) +
+  geom_ribbon(aes(ymin=power-se, ymax=power+se),
+              color=NA,
+              alpha=0.3) +
+  geom_line(linewidth = 1) +
+  geom_vline(xintercept = c(0, 1, 2, 2.75),
+             linetype = "dashed",
+             color = "gray37") +
+  labs(x = "Time (s)",
+       y = paste(y_axis_power_label, "(z)", sep=" "),
+       title = "") +
+  facet_wrap(~association_strength, ncol=1, strip.position="top") +
+  geom_text(aes(label = event,
+                x = time,
+                y = position),
+            data = ret_labels,
+            inherit.aes = FALSE,
+            angle = 90,
+            hjust = 1,
+            vjust = 1.3,
+            size = 3.5,
+            colour = "gray37",
+            family = fontfamily) +
+  guides(linetype = "none") + 
+  scale_color_manual(values=hit_miss_palette, name="") + 
+  scale_fill_manual(values=hit_miss_palette, name="") + 
+  theme(strip.text.x = element_text(size=12),
+        strip.text.y = element_text(size=12),
+        plot.title = element_blank())
+
+timeseries.plt +
+  beta.no.intercept.plt + 
+  plot_layout(widths = c(10, 10),
+              guides = "collect") & theme(legend.position = "top")
+
+```
+
+## Cluster correction
+
+```{r permute, eval=T, echo=F}
+n_permutations <- 1000
+
+run_permutation_test <- F
+
+if (run_permutation_test) {
+  permute_betas <- function(data, n_permutations) {
+    results <- replicate(n_permutations, {
+      permuted_data <- data %>%
+        mutate(estimate = estimate * sample(c(-1, 1), n(), replace = TRUE))
+    }, simplify = FALSE)
+    bind_rows(results, .id = "permutation")
+  }
+  
+  betas.permuted <- power.betas %>%
+    group_by(subjectId, term) %>%
+    group_modify(~ permute_betas(.x, n_permutations = n_permutations)) %>%
+    ungroup() 
+  
+  tstats.permuted <- betas.permuted %>% 
+    group_by(permutation, time, term) %>% 
+    summarise(t_test = list(t.test(estimate))) %>%
+    mutate(
+      t_statistic = sapply(t_test, function(x) x$statistic),
+      p_value = sapply(t_test, function(x) x$p.value),
+      conf_int_lower = sapply(t_test, function(x) x$conf.int[1]),
+      conf_int_upper = sapply(t_test, function(x) x$conf.int[2])
+    ) %>%
+    select(-t_test) %>% 
+    mutate(p.adj = p_value) %>% 
+    ungroup() %>% 
+    dplyr::filter(p.adj < 0.05) %>% 
+    mutate(term = case_when(term == "association_strengthWeak (1x)" ~ "Memory strength (Weak v. Strong)",
+                            term == "association_strengthWeak (1x):is_incorrect" ~ "Memory outcome x Memory strength",
+                            term == "is_incorrect" ~ "Subsequent Miss v. Hit",
+                            .default="")) %>% 
+    dplyr::filter(term != "") %>% 
+    mutate(across(term,
+                  factor,
+                  level=c("Subsequent Miss v. Hit",
+                          "Memory strength (Weak v. Strong)",
+                          "Memory outcome x Memory strength")))
+  
+  tstats.permuted.clusters <- tstats.permuted %>% 
+    group_by(permutation, term) %>% 
+    mutate(time_diff = c(NA, diff(time))) %>% 
+    mutate(time_diff_back = lead(time_diff)) %>% 
+    mutate(time_diff = round(time_diff, 3),
+           time_diff_back = round(time_diff_back, 3)) %>% 
+    dplyr::filter(time_diff > sfreq | time_diff_back > sfreq | is.na(time_diff) | is.na(time_diff_back)) %>% 
+    ungroup() %>% 
+    select(permutation, term, time, time_diff, time_diff_back) %>% 
+    arrange(permutation, term, time) %>% 
+    dplyr::filter(time_diff_back == sfreq | time_diff == sfreq) %>% 
+    mutate(is_solo_point = ifelse(is.na(time_diff) & time_diff_back > sfreq, T, F)) %>% 
+    group_by(permutation, term, is_solo_point) %>% 
+    mutate(index_parity = if_else(row_number() %% 2 == 1, "start", "end")) %>% 
+    mutate(time_period = round(row_number()+1/2) / 2) %>% 
+    ungroup() %>% 
+    select(-time_diff, -time_diff_back) %>% 
+    pivot_wider(names_from=c("index_parity"),
+                values_from = "time") %>% 
+    select(-time_period, -is_solo_point) %>% 
+    mutate(cluster_size = end-start) %>% 
+    dplyr::filter(!is.na(cluster_size)) %>% 
+    # check if t-values within suspected clusters have same sign (need contiguous clusters)
+    left_join(tstats.permuted %>% 
+                select(permutation, time, term, t_statistic),
+              by = c("permutation", "term"),
+              multiple = "all") %>% 
+    dplyr::filter((time >= start) & (time <= end)) %>% 
+    mutate(t_stat_is_positive = sign(t_statistic) == 1) %>%
+    group_by(permutation, term, start, end, cluster_size) %>%
+    # checking sign of start and end points
+    summarize(n_timepoints = n(),
+              t_stat_same_sign = mean(t_stat_is_positive),
+              t_stat_same_sign = t_stat_same_sign %in% c(0, 1)) %>%
+    ungroup() %>%
+    # select clusters where t stats at the start and end are the same (otherwise not a contiguous cluster)
+    dplyr::filter(t_stat_same_sign) %>% 
+    left_join(clusters,
+              by = c("term"),
+              suffix = c(".permuted", ""),
+              multiple="all") %>% 
+    mutate(larger_than_real_cluster = cluster_size.permuted > cluster_size) %>% 
+    group_by(permutation, term, cluster_id) %>% 
+    summarize(has_larger_cluster = max(larger_than_real_cluster)) %>% 
+    ungroup()
+}
+
+tstats.permuted.clusters %>% 
+  group_by(cluster_id, term) %>% 
+  summarize(
+    n.permutations.with.clusters = n(),
+    permuted.p.value = sum(has_larger_cluster)/n_permutations) %>% 
+  kable() %>% 
+  kable_styling()
+```
+
+# Save 
+
+```{r save_betas}
+save(power.betas,
+     tstats.permuted.clusters,
+     file=paste("power", power_name, "submem_betas.RData", sep="_"))
+```
+
+# Load clusters
+
+```{r load_clusters, echo=F}
+load("spectral_pupil_clusters.RData")
+load(paste("power", power_name, "betas.RData", sep="_"))
+```
+
+```{r merge_clusters, echo=F}
+
+if (power_name == "frontal-theta") { 
+  start.name <- "start.frontal_theta"
+  end.name <- "end.frontal_theta"
+  cluster_id.power <- "cluster_id.frontal_theta"
+} else if (power_name == "posterior-alpha") { 
+  start.name <- "start.posterior_alpha"
+  end.name <- "end.posterior_alpha"
+  cluster_id.power <- "cluster_id.posterior_alpha"
+}
+
+clusters.this.power <- clusters.all %>% 
+  group_by(term, 
+           !!sym(cluster_id.power), 
+           !!sym(start.name), 
+           !!sym(end.name)) %>% 
+  summarize() %>% 
+  ungroup()
+
+clusters.this.power <- clusters.this.power %>% 
+  dplyr::filter(term == "Mismatch effect x Memory strength")
+
+clusters.this.power %>% 
+  kable() %>% 
+  kable_styling()
+
+power.clusters <- clusters.this.power %>% 
+  cross_join(power) %>% 
+  dplyr::filter(time >= !!sym(start.name) & time <= !!sym(end.name)) %>% 
+  group_by(subjectId, 
+           trialN, 
+           trial_outcome, 
+           association_strength, 
+           img,
+           probe,
+           match_response.rt,
+           term,
+           !!sym(cluster_id.power),
+           !!sym(start.name),
+           !!sym(end.name)) %>%
+  summarize(power = mean(power)) %>% 
+  ungroup()
+```
+
+```{r echo=F}
+power.submem <- power.clusters %>% 
+  dplyr::filter(trial_outcome == "CR") %>% 
+  mutate(img = probe) %>% 
+  select(-probe) %>% 
+  left_join(recognition_behavior %>% 
+              mutate(subjectId = participant_id) %>% 
+              select(-participant_id),
+            by = c("subjectId", "img"),
+            suffix = c(".retrieval", ".recognition")) %>%
+  dplyr::filter(!is.na(trial_outcome.recognition))
+
+power.submem.summary <- power.submem %>% 
+  group_by(subjectId, trialN.retrieval, 
+           trial_outcome.recognition, 
+           recognition_response.rt,
+           association_strength, 
+           !!sym(cluster_id.power)) %>% 
+  summarize(power = mean(power)) %>% 
+  ungroup() %>% 
+  group_by(subjectId, 
+           trial_outcome.recognition, 
+           association_strength, 
+           recognition_response.rt,
+           !!sym(cluster_id.power)) %>% 
+  summarize(power = mean(power)) %>% 
+  ungroup()
+```
+
+# Power & subsequent memory
+
+```{r plot_submem, echo=F, fig.height=6, fig.width=5}
+power.submem.summary %>% 
+  group_by(subjectId, 
+           association_strength, 
+           trial_outcome.recognition, 
+           !!sym(cluster_id.power)) %>% 
+  summarize(power = mean(power)) %>% 
+  summarySEwithin(., 
+                  measurevar="power", 
+                  withinvars=c("association_strength",
+                               "trial_outcome.recognition",
+                               cluster_id.power), 
+                  idvar="subjectId") %>% 
+  ggplot(aes(x = association_strength,
+             y = power,
+             fill = trial_outcome.recognition)) +
+  stat_summary(fun = "mean", 
+               geom = "bar", 
+               color = "black", 
+               position=position_dodge()) +
+  geom_errorbar(aes(ymin=power-se, ymax=power+se),
+                position=position_dodge(.9), 
+                width=.2) +
+  facet_wrap(reformulate(cluster_id.power), scales = "free", ncol=1) +
+  scale_color_manual(values=hit_miss_palette, name="") +
+  scale_fill_manual(values=hit_miss_palette, name="") +
+  labs(x = "", y = y_axis_power_label)
+```
+
+```{r submem_models, echo=F, results="asis", fig.height=3, fig.width=8}
+
+nbins <- 4
+
+for (this.cluster in power.submem.summary %>% pull(!!sym(cluster_id.power)) %>% unique()) {
+  cat("\n## Cluster", this.cluster ,"\n")
+  
+  mod.data <- power.submem.summary %>% 
+    dplyr::filter(!!sym(cluster_id.power) == this.cluster)
+  
+  mod <- mod.data %>% 
+    lmer(power ~ trial_outcome.recognition * association_strength + 
+           (trial_outcome.recognition + association_strength | subjectId),
+         data = .)
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>% 
+      lmer(power ~ trial_outcome.recognition * association_strength + 
+             (trial_outcome.recognition | subjectId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>% 
+      lmer(power ~ trial_outcome.recognition * association_strength + 
+             (1 | subjectId),
+           data = .)
+  }
+  
+  cluster.plt <- mod.data %>% 
+    group_by(subjectId, 
+             association_strength, 
+             trial_outcome.recognition, 
+             !!sym(cluster_id.power)) %>% 
+    summarize(power = mean(power)) %>% 
+    summarySEwithin(., 
+                    measurevar="power", 
+                    withinvars=c("association_strength",
+                                 "trial_outcome.recognition"), 
+                    idvar="subjectId") %>% 
+    ggplot(aes(x = association_strength,
+               y = power,
+               fill = trial_outcome.recognition)) +
+    stat_summary(fun = "mean", 
+                 geom = "bar", 
+                 color = "black", 
+                 position=position_dodge()) +
+    geom_errorbar(aes(ymin=power-se, ymax=power+se),
+                  position=position_dodge(.9), 
+                  width=.2) +
+    scale_color_manual(values=hit_miss_palette, name="") +
+    scale_fill_manual(values=hit_miss_palette, name="") +
+    labs(x = "", y = paste(y_axis_power_label, "(z)", sep=" "),
+         title = "")
+  
+  # print(cluster.plt)
+  
+  tidy(mod, effects = "fixed", conf.int = T, conf.level = 0.95) %>% 
+    select(term, estimate, conf.low, conf.high, p.value, std.error, df) %>%
+    kable(caption=paste(this.cluster, ": power ~ ", formula(mod)[3], sep=""),
+          digits=3) %>% 
+    kable_styling() %>%
+    cat()
+  
+  emm <- emmeans(mod, ~ trial_outcome.recognition | association_strength, adjust="none")
+  emm.pairs <- pairs(emm)
+  tidy(emm.pairs, effects = "fixed", conf.int = T, conf.level = 0.95) %>% 
+    select(association_strength, contrast, estimate, conf.low, conf.high, p.value, std.error) %>% 
+    kable(digits=3, caption="Recognition main effects") %>% 
+    kable_styling() %>% 
+    cat()
+  
+  ###
+  
+  mod <- mod.data %>% 
+    mutate(trial_outcome.recognition = recode(trial_outcome.recognition, 
+                                              "Hit" = 1,
+                                              "Miss" = 0)) %>% 
+    glmer(trial_outcome.recognition ~ power * association_strength + 
+            (power * association_strength | subjectId),
+          data = ., family="binomial")
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>% 
+      mutate(trial_outcome.recognition = recode(trial_outcome.recognition, 
+                                                "Hit" = 1,
+                                                "Miss" = 0)) %>% 
+      glmer(trial_outcome.recognition ~ power * association_strength + 
+              (power + association_strength | subjectId),
+            data = ., family="binomial")
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>% 
+      mutate(trial_outcome.recognition = recode(trial_outcome.recognition, 
+                                                "Hit" = 1,
+                                                "Miss" = 0)) %>% 
+      glmer(trial_outcome.recognition ~ power * association_strength + 
+              (1 | subjectId),
+            data = ., family="binomial")
+  }
+  
+  plt <- mod %>% 
+    plot_model(type="pred",
+               terms=c("power[all]",
+                       "association_strength[Strong (4x), Weak (1x)]"),
+               show.data=T) +
+    scale_color_manual(values=palette, name="") +
+    scale_fill_manual(values=palette, name="") +
+    labs(y = "P(remember probe)",
+         x = y_axis_power_label,
+         title = " ") +
+    theme(plot.title=element_blank(),
+          legend.position="none")
+  
+  # print(plt)
+  
+  tidy(mod, effects = "fixed", conf.int = T, conf.level = 0.95, exponentiate=T) %>%
+    select(term, estimate, conf.low, conf.high, p.value, std.error) %>%
+    kable(caption=paste(this.cluster, ": trial_outcome.recognition ~ ", formula(mod)[3], sep=""),
+          digits=3) %>% 
+    kable_styling() %>%
+    cat()
+  
+  mod.data <- power.submem.summary %>% 
+    dplyr::filter(trial_outcome.recognition == "Hit") %>% 
+    dplyr::filter(!!sym(cluster_id.power) == this.cluster)
+  
+  mod <- mod.data %>% 
+    lmer(recognition_response.rt ~ power * association_strength + 
+           (power * association_strength | subjectId),
+         data = .)
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>% 
+      lmer(recognition_response.rt ~ power * association_strength + 
+             (power + association_strength | subjectId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>% 
+      lmer(recognition_response.rt ~ power * association_strength + 
+             (power | subjectId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>% 
+      lmer(recognition_response.rt ~ power * association_strength + 
+             (1 | subjectId),
+           data = .)
+  }
+  
+  rt.plt <- mod.data %>% 
+    group_by(subjectId, trial_outcome.recognition, association_strength) %>% 
+    mutate(power_bin = cut_interval(power, 
+                                    n = nbins,
+                                    labels = F)) %>% 
+    ungroup() %>% 
+    group_by(subjectId, trial_outcome.recognition, association_strength,
+             power_bin) %>% 
+    summarize(rt = median(recognition_response.rt)) %>% 
+    summarySEwithin(., 
+                    measurevar="rt", 
+                    withinvars=c("association_strength",
+                                 "trial_outcome.recognition",
+                                 "power_bin"), 
+                    idvar="subjectId") %>% 
+    ggplot(aes(x = as.numeric(as.character(power_bin)),
+               y = rt,
+               color = association_strength,
+               group = association_strength)) +
+    geom_line(linewidth=0.8) +
+    geom_point(size=1.5) +
+    geom_errorbar(aes(ymin=rt-se, ymax=rt+se),
+                  width=0.2) +
+    scale_color_manual(values=palette, name="") +
+    scale_fill_manual(values=palette, name="") +
+    labs(x = paste(y_axis_power_label, "quartile", sep=" "), 
+         y = "RT (s)",
+         title = "")
+  
+  print(rt.plt)
+  
+  tidy(mod, effects = "fixed", conf.int = T, conf.level = 0.95) %>% 
+    select(term, estimate, conf.low, conf.high, p.value, std.error, df) %>% 
+    kable(caption=paste(this.cluster, ": recognition_response.rt ~ ", formula(mod)[3], sep=""),
+          digits=3) %>% 
+    kable_styling() %>%
+    cat()
+  
+  joint.plt <- (cluster.plt + plt + rt.plt) +
+    plot_layout(widths=c(1.4,1,1), 
+                guides="collect", axes = "collect", axis_titles = "collect")
+  
+  print(joint.plt)
+  
+  showtext_opts(dpi = 300)
+  ggsave(paste("submem_figures/submem_all_models_", power_name, "_cluster-", this.cluster, ".pdf", sep=""),
+         plot=joint.plt,
+         width=22,
+         height=7,
+         dpi=300,
+         create.dir=T,
+         units="cm")
+  showtext_opts(op)
+  
+  joint.plt <- (cluster.plt + rt.plt) +
+    plot_layout(widths=c(1.4,1), 
+                guides="collect", axes = "collect", axis_titles = "collect")
+  
+  print(joint.plt)
+  
+  showtext_opts(dpi = 300)
+  ggsave(paste("submem_figures/submem_all_models_", power_name, "_cluster-", this.cluster, "_hit_miss_rt.pdf", sep=""),
+         plot=joint.plt,
+         width=17,
+         height=7,
+         dpi=300,
+         create.dir=T,
+         units="cm")
+  showtext_opts(op)
+  
+}
+
+```
+
+# Power & subsequent memory RT
+
+```{r submem.rt, echo=F, fig.height=6, fig.width=5}
+
+nbins <- 4
+
+power.submem.summary %>% 
+  dplyr::filter(trial_outcome.recognition == "Hit") %>% 
+  group_by(subjectId, trial_outcome.recognition, association_strength, !!sym(cluster_id.power)) %>% 
+  mutate(power_bin = cut_interval(power, 
+                                  n = nbins,
+                                  labels = F)) %>% 
+  ungroup() %>% 
+  group_by(subjectId, trial_outcome.recognition, association_strength,
+           !!sym(cluster_id.power), power_bin) %>% 
+  summarize(rt = median(recognition_response.rt)) %>% 
+  summarySEwithin(., 
+                  measurevar="rt", 
+                  withinvars=c("association_strength",
+                               "trial_outcome.recognition",
+                               cluster_id.power,
+                               "power_bin"), 
+                  idvar="subjectId") %>% 
+  ggplot(aes(x = as.numeric(as.character(power_bin)),
+             y = rt,
+             color = association_strength,
+             group = association_strength)) +
+  geom_line(linewidth=0.8) +
+  geom_point(size=1.5) +
+  geom_errorbar(aes(ymin=rt-se, ymax=rt+se),
+                width=0.2) +
+  facet_grid(rows=vars(!!sym(cluster_id.power)), 
+             axes="all",
+             scales = "free") +
+  scale_color_manual(values=palette, name="") +
+  scale_fill_manual(values=palette, name="") +
+  labs(x = paste(y_axis_power_label, "quartile", sep=" "), y = "RT (s)")
+
+```
+
+# Power ~ RT & subsequent memory
+
+```{r rt_getclusters, echo=F}
+
+sfreq <- 0.008
+
+clusters.rt <- results.rt.betas %>% 
+  group_by(term) %>% 
+  mutate(time_diff = c(NA, diff(time))) %>% 
+  mutate(time_diff_back = lead(time_diff)) %>% 
+  mutate(time_diff = round(time_diff, 3),
+         time_diff_back = round(time_diff_back, 3)) %>% 
+  dplyr::filter(time_diff > sfreq | time_diff_back > sfreq | is.na(time_diff) | is.na(time_diff_back)) %>% 
+  ungroup() %>% 
+  select(term, time, time_diff, time_diff_back) %>% 
+  arrange(term, time) %>% 
+  dplyr::filter(time_diff_back == sfreq | time_diff == sfreq) %>% 
+  mutate(is_solo_point = ifelse(is.na(time_diff) & time_diff_back > sfreq, T, F)) %>% 
+  group_by(term, is_solo_point) %>% 
+  mutate(index_parity = if_else(row_number() %% 2 == 1, "start", "end")) %>% 
+  mutate(time_period = round(row_number()+1/2) / 2) %>% 
+  ungroup() %>% 
+  select(-time_diff, -time_diff_back) %>% 
+  pivot_wider(names_from=c("index_parity"),
+              values_from = "time") %>% 
+  select(-time_period, -is_solo_point) %>% 
+  mutate(cluster_size = end-start) %>% 
+  mutate(cluster_id = row_number())
+
+clusters.this.power <- clusters.rt %>% 
+  dplyr::filter(term == "Mismatch x Strength")
+
+power.clusters <- clusters.this.power %>% 
+  cross_join(power) %>% 
+  dplyr::filter(time >= start & time <= end) %>% 
+  group_by(subjectId, 
+           trialN, 
+           trial_outcome, 
+           association_strength, 
+           img,
+           probe,
+           match_response.rt,
+           term,
+           start,
+           end,
+           cluster_id) %>%
+  summarize(power = mean(power)) %>% 
+  ungroup()
+```
+
+```{r echo=F}
+power.submem <- power.clusters %>% 
+  dplyr::filter(trial_outcome == "CR") %>% 
+  mutate(img = probe) %>% 
+  select(-probe) %>% 
+  left_join(recognition_behavior %>% 
+              mutate(subjectId = participant_id) %>% 
+              select(-participant_id),
+            by = c("subjectId", "img"),
+            suffix = c(".retrieval", ".recognition")) %>%
+  dplyr::filter(!is.na(trial_outcome.recognition))
+
+power.submem.summary <- power.submem %>% 
+  group_by(subjectId, trialN.retrieval, 
+           trial_outcome.recognition, 
+           recognition_response.rt,
+           association_strength, 
+           cluster_id) %>% 
+  summarize(power = mean(power)) %>% 
+  ungroup() %>% 
+  group_by(subjectId, 
+           trial_outcome.recognition, 
+           association_strength, 
+           recognition_response.rt,
+           cluster_id) %>% 
+  summarize(power = mean(power)) %>% 
+  ungroup()
+```
+
+```{r rt_plot_submem, echo=F, fig.height=6, fig.width=5}
+power.submem.summary %>% 
+  group_by(subjectId, 
+           association_strength, 
+           trial_outcome.recognition, 
+           cluster_id) %>% 
+  summarize(power = mean(power)) %>% 
+  summarySEwithin(., 
+                  measurevar="power", 
+                  withinvars=c("association_strength",
+                               "trial_outcome.recognition",
+                               "cluster_id"), 
+                  idvar="subjectId") %>% 
+  ggplot(aes(x = association_strength,
+             y = power,
+             fill = trial_outcome.recognition)) +
+  stat_summary(fun = "mean", 
+               geom = "bar", 
+               color = "black", 
+               position=position_dodge()) +
+  geom_errorbar(aes(ymin=power-se, ymax=power+se),
+                position=position_dodge(.9), 
+                width=.2) +
+  facet_wrap(~ cluster_id, scales = "free", ncol=1) +
+  scale_color_manual(values=hit_miss_palette, name="") +
+  scale_fill_manual(values=hit_miss_palette, name="") +
+  labs(x = "", y = paste(y_axis_power_label, "(z)", sep=" "))
+```
+
+```{r rt_submem_models, echo=F, results="asis", fig.height=3, fig.width=8}
+
+for (this.cluster in power.submem.summary %>% pull(cluster_id) %>% unique()) {
+  mod.data <- power.submem.summary %>% 
+    dplyr::filter(cluster_id == this.cluster)
+  
+  mod <- mod.data %>% 
+    lmer(power ~ trial_outcome.recognition * association_strength + 
+           (trial_outcome.recognition * association_strength | subjectId),
+         data = .)
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>% 
+      lmer(power ~ trial_outcome.recognition * association_strength + 
+             (trial_outcome.recognition + association_strength | subjectId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>% 
+      lmer(power ~ trial_outcome.recognition * association_strength + 
+             (trial_outcome.recognition | subjectId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>% 
+      lmer(power ~ trial_outcome.recognition * association_strength + 
+             (1 | subjectId),
+           data = .)
+  }
+  
+  cluster.plt <- mod.data %>% 
+    group_by(subjectId, 
+             association_strength, 
+             trial_outcome.recognition, 
+             cluster_id) %>% 
+    summarize(power = mean(power)) %>% 
+    summarySEwithin(., 
+                    measurevar="power", 
+                    withinvars=c("association_strength",
+                                 "trial_outcome.recognition"), 
+                    idvar="subjectId") %>% 
+    ggplot(aes(x = association_strength,
+               y = power,
+               fill = trial_outcome.recognition)) +
+    stat_summary(fun = "mean", 
+                 geom = "bar", 
+                 color = "black", 
+                 position=position_dodge()) +
+    geom_errorbar(aes(ymin=power-se, ymax=power+se),
+                  position=position_dodge(.9), 
+                  width=.2) +
+    scale_color_manual(values=hit_miss_palette, name="") +
+    scale_fill_manual(values=hit_miss_palette, name="") +
+    labs(x = "", y = y_axis_power_label,
+         title = this.cluster)
+  
+  # print(cluster.plt)
+  
+  tidy(mod, effects = "fixed", conf.int = T, conf.level = 0.95) %>% 
+    select(term, estimate, conf.low, conf.high, p.value, std.error, df) %>%
+    kable(caption=paste(this.cluster, ": ", formula(mod)[3], sep=""),
+          digits=3) %>% 
+    kable_styling() %>%
+    cat()
+  
+  ###
+  
+  mod <- mod.data %>% 
+    mutate(trial_outcome.recognition = recode(trial_outcome.recognition, 
+                                              "Hit" = 1,
+                                              "Miss" = 0)) %>% 
+    glmer(trial_outcome.recognition ~ power * association_strength + 
+            (power * association_strength | subjectId),
+          data = ., family="binomial")
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>% 
+      mutate(trial_outcome.recognition = recode(trial_outcome.recognition, 
+                                                "Hit" = 1,
+                                                "Miss" = 0)) %>% 
+      glmer(trial_outcome.recognition ~ power * association_strength + 
+              (power + association_strength | subjectId),
+            data = ., family="binomial")
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>% 
+      mutate(trial_outcome.recognition = recode(trial_outcome.recognition, 
+                                                "Hit" = 1,
+                                                "Miss" = 0)) %>% 
+      glmer(trial_outcome.recognition ~ power * association_strength + 
+              (1 | subjectId),
+            data = ., family="binomial")
+  }
+  
+  plt <- mod %>% 
+    plot_model(type="pred",
+               terms=c("power[all]",
+                       "association_strength[Strong (4x), Weak (1x)]"),
+               show.data=T) +
+    scale_color_manual(values=palette, name="") +
+    scale_fill_manual(values=palette, name="") +
+    labs(y = "P(remember probe)",
+         x = y_axis_power_label,
+         title = paste("Power cluster:", this.cluster, sep=" "))
+  
+  # print(plt)
+  
+  tidy(mod, effects = "fixed", conf.int = T, conf.level = 0.95, exponentiate=T) %>%
+    select(term, estimate, conf.low, conf.high, p.value, std.error) %>%
+    kable(caption=paste(this.cluster, ": ", formula(mod)[3], sep=""),
+          digits=3) %>% 
+    kable_styling() %>%
+    cat()
+  
+  ((cluster.plt + plt) +
+      plot_layout(guides = "collect")) %>% 
+    print()
+  
+}
+
+```
+
+# Power ~ RT & subsequent memory RT
+
+```{r rt_submem.rt, echo=F, fig.height=6, fig.width=5}
+
+nbins <- 4
+
+power.submem.summary %>% 
+  dplyr::filter(trial_outcome.recognition == "Hit") %>% 
+  group_by(subjectId, trial_outcome.recognition, association_strength, cluster_id) %>% 
+  mutate(power_bin = cut_interval(power, 
+                                  n = nbins,
+                                  labels = F)) %>% 
+  ungroup() %>% 
+  group_by(subjectId, trial_outcome.recognition, association_strength,
+           cluster_id, power_bin) %>% 
+  summarize(rt = median(recognition_response.rt)) %>% 
+  summarySEwithin(., 
+                  measurevar="rt", 
+                  withinvars=c("association_strength",
+                               "trial_outcome.recognition",
+                               "cluster_id",
+                               "power_bin"), 
+                  idvar="subjectId") %>% 
+  ggplot(aes(x = as.numeric(as.character(power_bin)),
+             y = rt,
+             color = association_strength,
+             group = association_strength)) +
+  geom_line(linewidth=0.8) +
+  geom_point(size=1.5) +
+  geom_errorbar(aes(ymin=rt-se, ymax=rt+se),
+                width=0.2) +
+  facet_grid(rows=vars(cluster_id), 
+             axes="all",
+             scales = "free") +
+  scale_color_manual(values=palette, name="") +
+  scale_fill_manual(values=palette, name="") +
+  labs(x = paste(y_axis_power_label, "quartile", sep=" "), y = "RT (s)")
+
+```
+
+```{r rt_submem_rt_models, echo=F, results="asis", fig.height=3, fig.width=4}
+
+for (this.cluster in power.submem %>% pull(cluster_id) %>% unique()) {
+  mod.data <- power.submem.summary %>% 
+    dplyr::filter(trial_outcome.recognition == "Hit") %>% 
+    dplyr::filter(cluster_id == this.cluster)
+  
+  mod <- mod.data %>% 
+    lmer(recognition_response.rt ~ power * association_strength + 
+           (power * association_strength | subjectId),
+         data = .)
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>% 
+      lmer(recognition_response.rt ~ power * association_strength + 
+             (power + association_strength | subjectId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>% 
+      lmer(recognition_response.rt ~ power * association_strength + 
+             (power | subjectId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>% 
+      lmer(recognition_response.rt ~ power * association_strength + 
+             (1 | subjectId),
+           data = .)
+  }
+  
+  rt.plt <- mod.data %>% 
+    group_by(subjectId, trial_outcome.recognition, association_strength) %>% 
+    mutate(power_bin = cut_interval(power, 
+                                    n = nbins,
+                                    labels = F)) %>% 
+    ungroup() %>% 
+    group_by(subjectId, trial_outcome.recognition, association_strength,
+             power_bin) %>% 
+    summarize(rt = median(recognition_response.rt)) %>% 
+    summarySEwithin(., 
+                    measurevar="rt", 
+                    withinvars=c("association_strength",
+                                 "trial_outcome.recognition",
+                                 "power_bin"), 
+                    idvar="subjectId") %>% 
+    ggplot(aes(x = as.numeric(as.character(power_bin)),
+               y = rt,
+               color = association_strength,
+               group = association_strength)) +
+    geom_line(linewidth=0.8) +
+    geom_point(size=1.5) +
+    geom_errorbar(aes(ymin=rt-se, ymax=rt+se),
+                  width=0.2) +
+    scale_color_manual(values=palette, name="") +
+    scale_fill_manual(values=palette, name="") +
+    labs(x = paste(y_axis_power_label, "quartile", sep=" "), 
+         y = "RT (s)",
+         title = this.cluster)
+  
+  print(rt.plt)
+  
+  tidy(mod, effects = "fixed", conf.int = T, conf.level = 0.95) %>% 
+    select(term, estimate, conf.low, conf.high, p.value, std.error, df) %>% 
+    kable(caption=paste(this.cluster, ": ", formula(mod)[3], sep=""),
+          digits=3) %>% 
+    kable_styling() %>%
+    cat()
+  
+}
+
+```

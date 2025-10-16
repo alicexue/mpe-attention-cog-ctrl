@@ -1,0 +1,148 @@
+---
+title: "Compare tPCA loadings across with and without error trials"
+author: "Alice M. Xue (alicexue@stanford.edu)"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(stats)
+library(dplyr)
+library(tidyverse)
+library(kableExtra)
+library(broom)
+library(ggplot2)
+library(sysfonts)
+library(showtext)
+library(sjPlot)
+library(patchwork)
+```
+
+```{r, echo=F}
+font_add(family = "Avenir Next",
+         regular = "../utils/AvenirNext-Regular.ttf",
+         bold = "../utils/AvenirNext-DemiBold.ttf",
+         italic = "../utils/AvenirNext-Italic.ttf")
+showtext.auto()
+op <- showtext_opts()
+
+fontfamily <- "Avenir Next"
+
+set_theme(
+  base=theme_classic(base_size = 12,
+                     base_family="Avenir Next"))
+```
+
+
+```{r, echo=F}
+
+load("pupil_tPCA.RData")
+mpe.combined.loadings <- loadings
+mpe.combined.pc.key <- subj.data.scores %>% 
+  group_by(component_orig, component) %>% 
+  summarize() %>% 
+  arrange(component)
+
+load("pupil_tPCA_correct_only.RData")
+mpe.correct.only.loadings <- loadings
+mpe.correct.only.pc.key <- subj.data.scores %>% 
+  group_by(component_orig, component) %>% 
+  summarize() %>% 
+  arrange(component)
+
+```
+
+```{r, echo=F}
+correct.only.loadings.name <- c("Memory reinstatement"=1,
+                       "Preparatory attention"=2,
+                       "Prediction error x strength"=3,
+                       "Orienting response"=4,
+                       "Cognitive effort"=5,
+                       "Stimulus & mismatch detection"=6
+)
+
+combined.loadings.name <- c("Memory reinstatement"=1,
+                       "Preparatory attention"=2,
+                       "Prediction error x strength"=3,
+                       "Orienting response"=4,
+                       "Cognitive effort"=5,
+                       "Stimulus & mismatch detection"=6
+)
+
+```
+
+```{r, echo=F, results="asis"}
+
+plts <- list()
+
+for (comp in names(correct.only.loadings.name)) {
+  correct.only.pc <- gsub("PC", 
+                 "",
+                 mpe.correct.only.pc.key[["component_orig"]][[correct.only.loadings.name[[comp]]]])
+  correct.only <- mpe.correct.only.loadings[, as.integer(correct.only.pc)]
+  combined.pc <- gsub("PC", 
+                   "", 
+                   mpe.combined.pc.key[["component_orig"]][[combined.loadings.name[[comp]]]])
+  combined <- mpe.combined.loadings[, as.integer(combined.pc)]
+  
+  
+  pc.corr <- cor.test(
+    correct.only, 
+    combined, 
+    method = "pearson")
+  
+  tidy(pc.corr) %>% 
+    kable(caption = comp) %>% 
+    kable_styling() %>% 
+    cat()
+  
+  data <- as_tibble(list("correct.only"=correct.only, "combined"=combined)) %>% 
+    mutate(time = row_number() / 100) %>% 
+    pivot_longer(cols = c("correct.only", "combined"),
+                 names_to = "exp",
+                 values_to = "loading") %>% 
+    mutate(across(exp, 
+                  factor, 
+                  levels=c("correct.only", "combined")))
+  
+  fig <- data %>%
+    ggplot(aes(x = time,
+               y = loading,
+               color = exp)) +
+    geom_line() +
+    geom_text(aes(x = 2,
+                  y = max(data$loading),
+                  label = r_and_p),
+              data = tidy(pc.corr) %>% 
+                mutate(r_and_p = paste("r=",
+                                       round(estimate,2),
+                                       "***",
+                                       sep="")),
+              colour = "gray18",
+              vjust = -0.5,
+              size = 3,
+              family = fontfamily,) +
+    ylim(-0.3, 1) +
+    labs(x = "Time (s)", y = "PC loading", title = comp) +
+    scale_color_manual(values=c("springgreen4", "springgreen3"))
+  
+  print(fig)
+  
+  plts[[comp]] <- fig
+}
+
+
+print((plts[[1]] + 
+         plts[[2]] +
+         plts[[3]] +
+         plts[[4]] +
+         plts[[5]] +
+         plts[[6]]) + 
+        plot_layout(guides = "collect") & theme(plot.title = element_text(size=9),
+                                                axis.title = element_text(size=9),
+                                                axis.text = element_text(size=9),
+                                                legend.position = "bottom"))
+
+```
+
+

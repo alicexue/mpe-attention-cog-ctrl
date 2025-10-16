@@ -1,0 +1,3646 @@
+---
+title: "EEG - pupil relationships"
+author: "Alice M. Xue (alicexue@stanford.edu)"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+params:
+    power_name: "frontal-theta"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 3
+    toc_float:
+      collapsed: no
+    self_contained: yes
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+---
+
+```{r setup, include=FALSE}
+library(plyr)
+library(tidymv)
+library(Hmisc)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+library(data.table)
+library(psycho)
+library(lme4)
+library(sjPlot)
+library(afex)
+library(viridis)
+library(showtext)
+library(tidyverse)
+library(mgcv)
+library(itsadug)
+library(RColorBrewer)
+library(ggcorrplot)
+library(devtools)
+library(factoextra)
+library(tidyjson)
+library(purrr)
+library(broom)
+library(zoo)
+library(psych)
+library(patchwork)
+library(emmeans)
+library(ggpubr)
+library(stats)
+library(broom.mixed)
+library(pracma)
+library(afex)
+library(gsignal)
+library(fuzzyjoin)
+
+font_add(family = "Avenir Next",
+         regular = "../utils/AvenirNext-Regular.ttf",
+         bold = "../utils/AvenirNext-DemiBold.ttf",
+         italic = "../utils/AvenirNext-Italic.ttf")
+showtext.auto()
+
+fontfamily <- "Avenir Next"
+
+set_theme(
+  base=theme_classic(base_size = 12,
+                     base_family="Avenir Next",
+                     base_line_size = 12/30,
+                     base_rect_size = 12/30)
+)
+
+options(dplyr.summarise.inform = FALSE)
+
+knitr::opts_chunk$set(echo = TRUE, 
+                      warning=FALSE, 
+                      message = FALSE, 
+                      fig.showtext=TRUE)
+
+# knitr::opts_chunk$set(dev = 'pdf') # set output device to pdf
+
+source("../utils/summary_se_utils.R")
+```
+
+```{r get_behavior, echo=F}
+set.seed(478)
+
+power_name <- params$power_name
+
+stopifnot(power_name %in% c("frontal-theta", "posterior-alpha"))
+
+if (power_name == "frontal-theta") {
+  hits <- fread("../../data/eeg/MPE_frontal_theta_asso_retrieval_Hit.csv")
+  crs <- fread("../../data/eeg/MPE_frontal_theta_asso_retrieval_CR.csv")
+  y_axis_power_label = "Frontal theta"
+} else if (power_name == "posterior-alpha") {
+  hits <- fread("../../data/eeg/MPE_posterior_alpha_asso_retrieval_Hit.csv")
+  crs <- fread("../../data/eeg/MPE_posterior_alpha_asso_retrieval_CR.csv")
+  y_axis_power_label = "Posterior alpha"
+}
+
+power <- bind_rows(list(hits, crs))
+
+greek.beta <- "\u03B2"
+```
+
+```{r labels, echo=F}
+palette <- c("#008080", "#9fdfbf")
+beta_palette <- c("#A7A2A9", "#9E0059", "#1A936F", "#FFD131")
+org_blue_rep_palette <- c("#1a75ff", "#ff751a", "#1a75ff", "#ff751a")
+
+sfreq <- 0.008
+
+ret_labels_strong <- tibble(event = c("cue", "delay", "probe", "ITI"),
+                            time = c(0, 1, 2, 2.75))
+
+ret_labels_weak <- tibble(event = c("cue", "delay", "probe", "ITI"),
+                          time = c(0, 1, 2, 2.75))
+
+ret_labels <- rbind(ret_labels_strong, ret_labels_weak)
+
+if (power_name == "frontal-theta") {
+  ret_labels$position <- 1
+} else if (power_name == "posterior-alpha") {
+  ret_labels$position <- 0.5
+}
+
+if (power_name == "frontal-theta") {
+  ymin.power <- -0.5
+  ymax.power <- 1.5
+} else if (power_name == "posterior-alpha") {
+  ymin.power <- -0.6
+  ymax.power <- 0.5
+}
+
+run_pupil_models <- F
+
+```
+
+```{r load_pupil, echo=F}
+retrieval_pupil <- fread("../../data/pupil/MPE_imm_retrieval_pupil.csv")
+```
+
+
+```{r echo=F}
+power.summarized <- power %>%
+  mutate(hit = is_match_trial & (match_response.keys==1)) %>%
+  mutate(false_alarm = !is_match_trial & (match_response.keys==1)) %>%
+  mutate(miss = is_match_trial & (match_response.keys==2)) %>%
+  mutate(correct_rejection = !is_match_trial & (match_response.keys==2)) %>%
+  mutate(customlinetype = ifelse(hit | correct_rejection,
+                                 0,
+                                 1)) %>% 
+  mutate(trial_outcome = case_when(hit ~ "Match",
+                                   false_alarm ~ "False alarm (mismatch)",
+                                   miss ~ "Miss (match)",
+                                   correct_rejection ~ "Mismatch")) %>%
+  dplyr::filter(!is.na(match_response.rt)) %>%  
+  dplyr::filter(trial_outcome %in% c("Match", "False alarm (mismatch)", "Miss (match)", "Mismatch")) %>% 
+  group_by(time,
+           subjectId,
+           association_strength,
+           customlinetype,
+           trial_outcome) %>% 
+  summarize(power = mean(power)) %>% 
+  ungroup() 
+```
+
+```{r load_clusters, echo=F}
+
+if (file.exists("../pupil/pupil_betas.RData")) {
+  load("../pupil/pupil_betas.RData")
+  pupil.results.betas <- results.betas
+  pupil.results.rt.betas <- results.rt.betas
+  rm(results.betas, results.rt.betas, params)
+} else {
+  print("Could not find pupil_betas.RData")
+}
+
+if (file.exists("spectral_pupil_clusters.RData")) {
+  load("spectral_pupil_clusters.RData")
+} else {
+  print("Could not find spectral_pupil_clusters.RData")
+}
+
+power.beta.rdata <- paste("power", power_name, "betas.RData", sep="_")
+if (file.exists(power.beta.rdata)) {
+  load(power.beta.rdata)
+} else {
+  print(paste("Could not find", power.beta.rdata))
+  print("Use spectral_timeseries.Rmd; see generate_power_reports.R")
+}
+
+pupil.model.rdata <- paste("power", power_name, "pupil_models.RData", sep="_")
+if (file.exists(pupil.model.rdata)) {
+  load(pupil.model.rdata)
+} else {
+  print(paste("Could not find", pupil.model.rdata))
+}
+
+if (power_name == "frontal-theta" | power_name == "posterior-alpha") {
+  # model fitting failed for these subjects
+  exclude.subs <- c("MPE136", "MPE144")
+}
+
+```
+
+```{r merge_clusters, echo=F}
+
+if (power_name == "frontal-theta") { 
+  start.name <- "start.frontal_theta"
+  end.name <- "end.frontal_theta"
+  cluster_id.power <- "cluster_id.frontal_theta"
+} else if (power_name == "posterior-alpha") { 
+  start.name <- "start.posterior_alpha"
+  end.name <- "end.posterior_alpha"
+  cluster_id.power <- "cluster_id.posterior_alpha"
+}
+
+clusters.this.power <- clusters.all %>% 
+  group_by(term, 
+           cluster_id.pupil, 
+           !!sym(cluster_id.power), 
+           start.pupil, 
+           end.pupil,
+           comparison,
+           !!sym(start.name), 
+           !!sym(end.name)) %>% 
+  summarize() %>% 
+  ungroup() %>% 
+  # rename comparison by getting rid of other power cluster
+  mutate(comparison = paste(term,
+                            "\npupil", cluster_id.pupil,
+                            "v. power", !!sym(cluster_id.power), sep=" "))
+
+# if (!exists("pupil.power.data")) {
+pupil.clusters <- clusters.this.power %>% 
+  cross_join(retrieval_pupil) %>% 
+  dplyr::filter(time >= start.pupil & time <= end.pupil) %>% 
+  group_by(subjectId, 
+           trialN, 
+           trial_outcome, 
+           association_strength, 
+           term,
+           cluster_id.pupil,
+           comparison,
+           start.pupil,
+           end.pupil) %>% 
+  summarize(pupil_diameter_z = mean(pupil_diameter_z)) %>% 
+  ungroup()
+
+power.clusters <- clusters.this.power %>% 
+  cross_join(power) %>% 
+  dplyr::filter(time >= !!sym(start.name) & time <= !!sym(end.name)) %>% 
+  group_by(subjectId, 
+           trialN, 
+           trial_outcome, 
+           association_strength, 
+           term,
+           !!sym(cluster_id.power),
+           comparison,
+           !!sym(start.name),
+           !!sym(end.name)) %>%
+  summarize(power = mean(power)) %>% 
+  ungroup()
+
+pupil.power.data <- pupil.clusters %>% 
+  full_join(power.clusters, by=c("subjectId", "trialN", "trial_outcome",
+                                 "association_strength", "term",
+                                 "comparison"),
+            suffix = c(".pupil", ".power"))
+# }
+
+
+if (power_name == "frontal-theta") {
+  cluster.ids <- c(3, 7)
+} else if (power_name == "posterior-alpha") {
+  cluster.ids <- c(3, 4, 8)
+}
+
+interaction.MPE.data <- pupil.clusters %>% 
+  select(-comparison) %>% 
+  group_by(subjectId, 
+           trialN, 
+           trial_outcome, 
+           association_strength, 
+           term, 
+           cluster_id.pupil, 
+           start.pupil,
+           end.pupil, 
+           pupil_diameter_z) %>% 
+  summarize() %>% 
+  dplyr::filter(cluster_id.pupil %in% c(2, 4)) %>% 
+  full_join(power.clusters %>% 
+              dplyr::filter(!!sym(cluster_id.power) %in% cluster.ids) %>% 
+              select(-comparison) %>% 
+              group_by(subjectId, 
+                       trialN, 
+                       trial_outcome, 
+                       association_strength, 
+                       term, 
+                       !!sym(cluster_id.power), 
+                       !!sym(start.name),
+                       !!sym(end.name), 
+                       power), 
+            by=c("subjectId", 
+                 "trialN", 
+                 "trial_outcome",
+                 "association_strength"),
+            suffix = c(".pupil", ".power")) %>% 
+  mutate(comparison = paste(term.pupil,
+                            "pupil", cluster_id.pupil,
+                            "\n",
+                            term.power,
+                            "v. power", !!sym(cluster_id.power), sep=" ")) %>% 
+  dplyr::filter(term.pupil != term.power)
+```
+
+
+```{r get_pupil_time_periods, echo=F, fig.width=8, fig.height=8}
+
+level_order <- c("Match",  "Mismatch")
+
+match.power.plt <- power.summarized %>%
+  summarySEwithin(.,
+                  measurevar="power",
+                  withinvars=c("association_strength",
+                               "trial_outcome",
+                               "customlinetype",
+                               "time"),
+                  idvar="subjectId") %>%
+  dplyr::filter(trial_outcome == "Match") %>%
+  ggplot(aes(x = as.numeric(as.character(time)),
+             y = power,
+             color = association_strength,
+             fill = association_strength)) +
+  geom_ribbon(aes(ymin=power-se, ymax=power+se),
+              color=NA,
+              alpha=0.3) +
+  geom_line(aes(linetype = as.factor(customlinetype)),
+            linewidth = 1) +
+  geom_vline(xintercept = c(0, 1, 2, 2.75),
+             linetype = "dashed",
+             color = "gray37") +
+  labs(x = "Time (s)",
+       y = "Power",
+       title = "") +
+  facet_wrap(~as.factor(trial_outcome, level = level_order), nrow=2) +
+  geom_text(aes(label = event,
+                x = time,
+                y = position),
+            data = ret_labels,
+            inherit.aes = FALSE,
+            angle = 90,
+            hjust = 1,
+            vjust = 1.3,
+            size = 3,
+            colour = "gray37",
+            family = fontfamily) +
+  guides(linetype = "none") +
+  scale_color_manual(values=palette, name="") +
+  scale_fill_manual(values=palette, name="") +
+  theme(strip.text.x = element_text(size=8),
+        strip.text.y = element_text(size=8),
+        axis.text.x = element_text(size=8),
+        axis.text.y = element_text(size=8),
+        legend.position="none")
+
+small.power.plt <- power.summarized %>% 
+  mutate(trial_outcome = factor(trial_outcome, 
+                                levels=c("Match", "Mismatch"))) %>%
+  mutate(correct = ifelse(trial_outcome %in% c("Match", "Mismatch"), 
+                          "Correct", "Incorrect")) %>% 
+  mutate(trial_type = ifelse(trial_outcome %in% c("Match", "Miss (match)"), 
+                             "Match", "Mismatch")) %>% 
+  dplyr::filter(correct == "Correct") %>%
+  summarySEwithin(.,
+                  measurevar="power",
+                  withinvars=c("association_strength",
+                               "trial_outcome",
+                               "trial_type",
+                               "correct",
+                               "customlinetype",
+                               "time"),
+                  idvar="subjectId") %>%
+  ggplot(aes(x = as.numeric(as.character(time)), 
+             y = power,
+             color = trial_type,
+             fill = trial_type)) +
+  geom_ribbon(aes(ymin=power-se, ymax=power+se),
+              color=NA,
+              alpha=0.3) +
+  geom_line(aes(linetype = as.factor(customlinetype)),
+            linewidth = 1) +
+  geom_vline(xintercept = c(0, 1, 2, 2.75),
+             linetype = "dashed",
+             color = "gray37") +
+  labs(x = "Time (s)",
+       y = "Power",
+       title = "") +
+  facet_wrap(~association_strength, ncol=1) +
+  guides(linetype = "none") + 
+  scale_color_manual(values=c("#1a75ff", "#ff751a", "#1a75ff", "#ff751a"), name="") + 
+  scale_fill_manual(values=c("#1a75ff", "#ff751a", "#80b3ff", "#ff751a"), name="") + 
+  theme(strip.text.x = element_text(size=12),
+        strip.text.y = element_text(size=12),
+        axis.text.x = element_text(size=8),
+        axis.text.y = element_text(size=8),
+        legend.position="none")
+
+### pupil below
+
+pupil_summarized <- retrieval_pupil %>%
+  mutate(trial_outcome = case_when(hit ~ "Match",
+                                   false_alarm ~ "False alarm (mismatch)",
+                                   miss ~ "Miss (match)",
+                                   correct_rejection ~ "Mismatch")) %>%
+  dplyr::filter(trial_outcome %in% c("Match", "False alarm (mismatch)", "Miss (match)", "Mismatch")) %>% 
+  group_by(time,
+           subjectId,
+           association_strength,
+           customlinetype,
+           trial_outcome) %>% 
+  summarize(pupil_diameter_z = mean(pupil_diameter_z)) %>% 
+  ungroup() 
+
+small.pupil.plt <- pupil_summarized %>% 
+  mutate(trial_outcome = factor(trial_outcome, 
+                                levels=c("Match", "Mismatch"))) %>%
+  mutate(correct = ifelse(trial_outcome %in% c("Match", "Mismatch"), 
+                          "Correct", "Incorrect")) %>% 
+  mutate(trial_type = ifelse(trial_outcome %in% c("Match", "Miss (match)"), 
+                             "Match", "Mismatch")) %>% 
+  dplyr::filter(correct == "Correct") %>% 
+  summarySEwithin(.,
+                  measurevar="pupil_diameter_z",
+                  withinvars=c("association_strength",
+                               "trial_outcome",
+                               "trial_type",
+                               "correct",
+                               "customlinetype",
+                               "time"),
+                  idvar="subjectId") %>%
+  ggplot(aes(x = as.numeric(as.character(time)), 
+             y = pupil_diameter_z,
+             color = trial_type,
+             fill = trial_type)) +
+  geom_ribbon(aes(ymin=pupil_diameter_z-se, ymax=pupil_diameter_z+se),
+              color=NA,
+              alpha=0.3) +
+  geom_line(aes(linetype = as.factor(customlinetype)),
+            linewidth = 1) +
+  geom_vline(xintercept = c(0, 1, 2, 2.75),
+             linetype = "dashed",
+             color = "gray37") +
+  labs(x = "Time (s)",
+       y = "Pupil",
+       title = "") +
+  facet_wrap(~association_strength, ncol=1) +
+  guides(linetype = "none") + 
+  scale_color_manual(values=c("#1a75ff", "#ff751a", "#1a75ff", "#ff751a"), name="") + 
+  scale_fill_manual(values=c("#1a75ff", "#ff751a", "#1a75ff", "#ff751a"), name="") + 
+  theme(strip.text.x = element_text(size=12),
+        strip.text.y = element_text(size=12),
+        axis.text.x = element_text(size=8),
+        axis.text.y = element_text(size=8),
+        legend.position="none")
+
+```
+
+```{r echo=F}
+betas.df <- power.betas %>% 
+  group_by(time, term) %>% 
+  summarize(se = sd(estimate, na.rm=T) / sqrt(sum(!is.na(estimate))),
+            estimate = mean(estimate, na.rm=T)) %>% 
+  ungroup() %>% 
+  mutate(term = case_when(term == "association_strengthWeak (1x)" ~ "Memory strength (Weak v. Strong)",
+                          term == "association_strengthWeak (1x):is_mismatch" ~ "Mismatch effect x Memory strength",
+                          term == "is_mismatch" ~ "Mismatch v. Match",
+                          term == "(Intercept)" ~ "Intercept",
+                          .default="")) %>% 
+  dplyr::filter(term != "") %>% 
+  mutate(across(term,
+                factor,
+                levels = c("Intercept",
+                           "Mismatch v. Match",
+                           "Memory strength (Weak v. Strong)",
+                           "Mismatch effect x Memory strength")))
+```
+
+## Power ~ pupil
+
+```{r mean_pupil_power_comp, echo=F, fig.width=8, fig.height=5, results="asis", eval=T}
+
+nbins <- 5
+
+ymin.pupil <- -0.4
+ymax.pupil <- 0.5
+
+if (power_name == "frontal-theta") {
+  ymin.power <- -0.2
+  ymax.power <- 0.6
+} else if (power_name == "posterior-alpha") {
+  ymin.power <- -0.5
+  ymax.power <- 0.5
+}
+
+if (!exists("mean.pupil.models") | run_pupil_models) {
+  mean.pupil.models <- list()
+}
+
+mean.pupil.plts <- list()
+mean.pupil.beta.plts <- list()
+
+if (power_name == "frontal-theta") {
+  comparisons.of.interest <- c("Memory strength (Weak v. Strong) \npupil 2 v. power 3")
+  
+} else if (power_name == "posterior-alpha") {
+  comparisons.of.interest <- c("Memory strength (Weak v. Strong) \npupil 2 v. power 3",
+                               "Memory strength (Weak v. Strong) \npupil 2 v. power 4")
+}
+
+for (this.comparison in comparisons.of.interest) {
+  mod.data <- pupil.power.data %>%
+    dplyr::filter(comparison == this.comparison) %>%
+    dplyr::filter(!is.na(power)) %>%
+    dplyr::filter(!is.na(pupil_diameter_z)) %>%
+    mutate(trial_outcome = as.character(trial_outcome)) %>%
+    dplyr::filter(trial_outcome %in% c("Hit", "CR")) %>%
+    mutate(trial_outcome = recode(trial_outcome,
+                                  "Hit" = "Match",
+                                  "CR" = "Mismatch"))
+  
+  binned.plt <- mod.data %>%
+    group_by(subjectId, trial_outcome, association_strength) %>%
+    mutate(trial_count = n()) %>%
+    ungroup() %>%
+    dplyr::filter(trial_count > nbins-1) %>%
+    group_by(subjectId, trial_outcome, association_strength) %>%
+    mutate(pupil_bin = cut_interval(pupil_diameter_z,
+                                    n = nbins,
+                                    labels = F)) %>%
+    ungroup() %>%
+    group_by(subjectId, trial_outcome, association_strength, pupil_bin) %>%
+    summarize(power = mean(power)) %>%
+    summarySEwithin(.,
+                    measurevar="power",
+                    withinvars=c("association_strength",
+                                 "trial_outcome",
+                                 "pupil_bin"),
+                    idvar="subjectId") %>%
+    ggplot(aes(x = as.numeric(as.character(pupil_bin)),
+               y = power,
+               color = trial_outcome,
+               fill = trial_outcome)) +
+    geom_line(linewidth=0.8) +
+    geom_point(size=1.5) +
+    geom_errorbar(aes(ymin=power-se, ymax=power+se),
+                  width=0.2) +
+    scale_color_manual(values=c("#1a75ff", "#ff751a", "#80b3ff", "#ffb380"), name="") +
+    scale_fill_manual(values=c("#1a75ff", "#ff751a", "#80b3ff", "#ffb380"), name="") +
+    facet_grid(cols=vars(association_strength)) +
+    labs(x = "Pupil diameter quintile", y = paste(y_axis_power_label, "(z)"),
+         title=this.comparison)
+  
+  mean.pupil.plts[[this.comparison]] <- binned.plt
+  
+  if (this.comparison == "Mismatch effect x Memory strength \npupil 4 v. power 7") {
+    pupil.cluster <- 4
+    power.cluster <- 7
+    this.term <- "Mismatch effect x Memory strength"
+    title <- "Mismatch x Strength"
+  }
+  if (this.comparison == "Mismatch effect x Memory strength \npupil 4 v. power 8") {
+    pupil.cluster <- 4
+    power.cluster <- 8
+    this.term <- "Mismatch effect x Memory strength"
+    title <- "Mismatch x Strength"
+  }
+  if (this.comparison == "Memory strength (Weak v. Strong) \npupil 2 v. power 3") {
+    pupil.cluster <- 2
+    power.cluster <- 3
+    this.term <- "Memory strength (Weak v. Strong)"
+    title <- "Strength"
+  }
+  if (this.comparison == "Memory strength (Weak v. Strong) \npupil 2 v. power 4") {
+    pupil.cluster <- 2
+    power.cluster <- 4
+    this.term <- "Memory strength (Weak v. Strong)"
+    title <- "Strength"
+  }
+  
+  if (this.term == "Mismatch v. Match") {
+    this.color <- "#9E0059"
+  } else if (this.term == "Memory strength (Weak v. Strong)") {
+    this.color <- "#1A936F"
+  } else {
+    this.color <- "#FFD131"
+  }
+  
+  beta.plt <- betas.df %>%
+    dplyr::filter(term == this.term) %>%
+    ggplot(aes(x=as.numeric(as.character(time)),
+               y=estimate,
+               color=term,
+               fill=term)) +
+    geom_ribbon(aes(ymin=estimate-se, ymax=estimate+se),
+                color=NA,
+                fill=this.color,
+                alpha=0.3) +
+    geom_line(linewidth = 0.6, color=this.color) +
+    geom_vline(xintercept = c(0, 1, 2, 2.75),
+               linetype = "dashed",
+               color = "gray37") +
+    geom_hline(yintercept = c(0),
+               linetype = "longdash",
+               color = "gray37") +
+    # mark significant difference
+    geom_point(aes(x = time,
+                   y = ypos),
+               color=this.color,
+               show.legend = F,
+               data = results.betas %>%
+                 dplyr::filter(cluster_id == power.cluster),
+               size = 1) +
+    labs(x = "Time (s)",
+         y = paste("Power", greek.beta),
+         title = title) +
+    guides(color="none",
+           fill="none") +
+    facet_wrap(~term, ncol=1, scales="free_y", strip.position="top") +
+    theme(strip.text.x = element_blank(),
+          axis.line.y=element_blank(),
+          axis.text.x=element_text(size=8.5),
+          axis.text.y=element_blank(),
+          axis.ticks.y=element_blank(),
+          axis.title = element_text(size=8.5),
+          strip.background=element_rect(colour=NA),
+          plot.title = element_text(size=8.5, hjust = 0.5))
+  
+  pupil.beta.plt <- pupil.betas %>%
+    group_by(time, term) %>%
+    summarize(se = sd(estimate) / sqrt(sum(!is.na(estimate))),
+              estimate = mean(estimate)) %>%
+    ungroup() %>%
+    mutate(term = case_when(term == "association_strengthWeak (1x)" ~ "Memory strength (Weak v. Strong)",
+                            term == "association_strengthWeak (1x):is_mismatch" ~ "Mismatch effect x Memory strength",
+                            term == "is_mismatch" ~ "Mismatch v. Match",
+                            term == "(Intercept)" ~ "Intercept",
+                            .default="")) %>%
+    dplyr::filter(term == this.term) %>%
+    ggplot(aes(x=as.numeric(as.character(time)),
+               y=estimate,
+               color=term,
+               fill=term)) +
+    geom_ribbon(aes(ymin=estimate-se, ymax=estimate+se),
+                color=NA,
+                alpha=0.3) +
+    geom_line(linewidth = 0.6, color=this.color) +
+    geom_vline(xintercept = c(0, 1, 2, 2.75),
+               linetype = "dashed",
+               color = "gray37") +
+    geom_hline(yintercept = c(0),
+               linetype = "longdash",
+               color = "gray37") +
+    # mark significant difference
+    geom_point(aes(x = time,
+                   y = ypos),
+               color = this.color,
+               show.legend = F,
+               data = pupil.results.betas %>%
+                 dplyr::filter(cluster_id == pupil.cluster),
+               size = 1) +
+    labs(x = "Time (s)",
+         y = paste("Pupil", greek.beta),
+         title = title) +
+    guides(color="none",
+           fill="none") +
+    facet_wrap(~term, ncol=1, scales="free_y", strip.position="top") +
+    scale_color_manual(values=c(this.color), name="") +
+    scale_fill_manual(values=c(this.color), name="") +
+    theme(strip.text.x = element_blank(),
+          axis.line.y=element_blank(),
+          axis.text.x=element_text(size=8.5),
+          axis.text.y=element_blank(),
+          axis.ticks.y=element_blank(),
+          axis.title = element_text(size=8.5),
+          strip.background=element_rect(colour=NA),
+          plot.title = element_text(size=8.5, hjust = 0.5))
+  
+  design <- "
+        ##########
+        ###2222222
+        ###2222222
+        ###2222222
+        1112222222
+        1112222222
+        ###2222222
+        #####333##
+        #####333##
+        "
+  
+  (
+    beta.plt +
+      binned.plt + # theme(plot.title = element_blank()) +
+      pupil.beta.plt +
+      plot_layout(design=design)) %>%
+    print()
+  
+  mean.pupil.beta.plts[[this.comparison]] <- pupil.beta.plt
+  
+  if (this.comparison %in% names(mean.pupil.models)) {
+    mod <- mean.pupil.models[[this.comparison]]
+  } else {
+    mod <- mod.data %>%
+      lmer(power ~ pupil_diameter_z * association_strength * trial_outcome +
+             (pupil_diameter_z * association_strength * trial_outcome | subjectId),
+           data = .)
+    
+    if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+      mod <- mod.data %>%
+        lmer(power ~ pupil_diameter_z * association_strength * trial_outcome +
+               (pupil_diameter_z + association_strength + trial_outcome | subjectId),
+             data = .)
+    }
+    
+    if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+      mod <- mod.data %>%
+        lmer(power ~ pupil_diameter_z * association_strength * trial_outcome +
+               (1 | subjectId),
+             data = .)
+    }
+    
+    mean.pupil.models[[this.comparison]] <- mod
+  }
+  
+  title <- formula(mod)[3]
+  
+  tidy(mod, effects = "fixed", conf.int = T, conf.level = 0.95) %>%
+    select(term, estimate, conf.low, conf.high, p.value, std.error, df) %>%
+    kable(caption=paste(this.comparison, ": ", title, sep=""),
+          digits=3) %>%
+    kable_styling() %>%
+    cat()
+  
+  tidy(mod, effects = "ran_pars", scales = "vcov") %>%
+    select(term, estimate) %>%
+    kable(digits=3, caption="Random effects") %>%
+    kable_styling() %>%
+    cat()
+  
+  slopes <- emtrends(mod, pairwise ~ association_strength * trial_outcome, var = "pupil_diameter_z")
+  
+  slopes %>% summary() %>% print()
+  
+  tidy(slopes$emtrends, conf.int = T, conf.level = 0.95) %>%
+    kable(caption=paste("slopes: pupil ~ ", title, sep=""),
+          digits=3) %>%
+    kable_styling() %>%
+    cat()
+  
+  tidy(slopes$contrasts, conf.int = T, conf.level = 0.95) %>%
+    select(contrast, estimate, std.error, df, conf.low, conf.high, statistic, adj.p.value) %>%
+    kable(caption=paste("slope contrasts: pupil ~ ", title, sep=""),
+          digits=3) %>%
+    kable_styling() %>%
+    cat()
+}
+
+```
+
+```{r echo=F, fig.width=5.2, fig.height=3, eval=F}
+for (fig in mean.pupil.plts) {
+  (fig + 
+     theme(plot.title=element_blank(),
+           legend.position = "none")) %>% 
+     print()
+}
+```
+
+
+## Pupil ~ power
+
+```{r, echo=F, fig.width=8, fig.height=5, results="asis", eval=T}
+
+nbins <- 5
+
+ymin.pupil <- -0.4
+ymax.pupil <- 0.5
+
+if (power_name == "frontal-theta") {
+  ymin.power <- -0.2
+  ymax.power <- 0.6
+} else if (power_name == "posterior-alpha") {
+  ymin.power <- -0.5
+  ymax.power <- 0.5
+}
+
+mean.pupil.plts <- list()
+
+if (power_name == "frontal-theta") {
+  comparisons.of.interest <- c("Memory strength (Weak v. Strong) \npupil 2 v. power 3")
+  
+} else if (power_name == "posterior-alpha") {
+  comparisons.of.interest <- c("Memory strength (Weak v. Strong) \npupil 2 v. power 3",
+                               "Memory strength (Weak v. Strong) \npupil 2 v. power 4")
+}
+
+for (this.comparison in comparisons.of.interest) {
+  mod.data <- pupil.power.data %>%
+    dplyr::filter(comparison == this.comparison) %>%
+    dplyr::filter(!is.na(power)) %>%
+    dplyr::filter(!is.na(pupil_diameter_z)) %>%
+    mutate(trial_outcome = as.character(trial_outcome)) %>%
+    dplyr::filter(trial_outcome %in% c("Hit", "CR")) %>%
+    mutate(trial_outcome = recode(trial_outcome,
+                                  "Hit" = "Match",
+                                  "CR" = "Mismatch"))
+  
+  binned.plt <- mod.data %>%
+    group_by(subjectId, trial_outcome, association_strength) %>%
+    mutate(trial_count = n()) %>%
+    ungroup() %>%
+    dplyr::filter(trial_count > nbins-1) %>%
+    group_by(subjectId, trial_outcome, association_strength) %>%
+    mutate(power_bin = cut_interval(power,
+                                    n = nbins,
+                                    labels = F)) %>%
+    ungroup() %>%
+    group_by(subjectId, trial_outcome, association_strength, power_bin) %>%
+    summarize(pupil = mean(pupil_diameter_z)) %>%
+    summarySEwithin(.,
+                    measurevar="pupil",
+                    withinvars=c("association_strength",
+                                 "trial_outcome",
+                                 "power_bin"),
+                    idvar="subjectId") %>%
+    ggplot(aes(x = as.numeric(as.character(power_bin)),
+               y = pupil,
+               color = trial_outcome,
+               fill = trial_outcome)) +
+    geom_line(linewidth=0.8) +
+    geom_point(size=1.5) +
+    geom_errorbar(aes(ymin=pupil-se, ymax=pupil+se),
+                  width=0.2) +
+    scale_color_manual(values=c("#1a75ff", "#ff751a", "#80b3ff", "#ffb380"), name="") +
+    scale_fill_manual(values=c("#1a75ff", "#ff751a", "#80b3ff", "#ffb380"), name="") +
+    facet_grid(cols=vars(association_strength)) +
+    labs(y = "Pupil diameter (z)", x = paste(y_axis_power_label, "quintile"),
+         title=this.comparison)
+  
+  mean.pupil.plts[[this.comparison]] <- binned.plt
+  
+  if (this.comparison == "Mismatch effect x Memory strength \npupil 4 v. power 7") {
+    pupil.cluster <- 4
+    power.cluster <- 7
+    this.term <- "Mismatch effect x Memory strength"
+    title <- "Mismatch x Strength"
+  }
+  if (this.comparison == "Mismatch effect x Memory strength \npupil 4 v. power 8") {
+    pupil.cluster <- 4
+    power.cluster <- 8
+    this.term <- "Mismatch effect x Memory strength"
+    title <- "Mismatch x Strength"
+  }
+  if (this.comparison == "Memory strength (Weak v. Strong) \npupil 2 v. power 3") {
+    pupil.cluster <- 2
+    power.cluster <- 3
+    this.term <- "Memory strength (Weak v. Strong)"
+    title <- "Strength"
+  }
+  if (this.comparison == "Memory strength (Weak v. Strong) \npupil 2 v. power 4") {
+    pupil.cluster <- 2
+    power.cluster <- 4
+    this.term <- "Memory strength (Weak v. Strong)"
+    title <- "Strength"
+  }
+  
+  beta.plt <- betas.df %>%
+    dplyr::filter(term == this.term) %>%
+    ggplot(aes(x=as.numeric(as.character(time)),
+               y=estimate,
+               color=term,
+               fill=term)) +
+    geom_ribbon(aes(ymin=estimate-se, ymax=estimate+se),
+                color=NA,
+                fill=this.color,
+                alpha=0.3) +
+    geom_line(linewidth = 0.6, color=this.color) +
+    geom_vline(xintercept = c(0, 1, 2, 2.75),
+               linetype = "dashed",
+               color = "gray37") +
+    geom_hline(yintercept = c(0),
+               linetype = "longdash",
+               color = "gray37") +
+    # mark significant difference
+    geom_point(aes(x = time,
+                   y = ypos),
+               color=this.color,
+               show.legend = F,
+               data = results.betas %>%
+                 dplyr::filter(cluster_id == power.cluster),
+               size = 1) +
+    labs(x = "Time (s)",
+         y = paste("Power", greek.beta),
+         title = title) +
+    guides(color="none",
+           fill="none") +
+    facet_wrap(~term, ncol=1, scales="free_y", strip.position="top") +
+    theme(strip.text.x = element_blank(),
+          axis.line.y=element_blank(),
+          axis.text.x=element_text(size=8.5),
+          axis.text.y=element_blank(),
+          axis.ticks.y=element_blank(),
+          axis.title = element_text(size=8.5),
+          strip.background=element_rect(colour=NA),
+          plot.title = element_text(size=8.5, hjust = 0.5))
+  
+  pupil.beta.plt <- pupil.betas %>%
+    group_by(time, term) %>%
+    summarize(se = sd(estimate) / sqrt(sum(!is.na(estimate))),
+              estimate = mean(estimate)) %>%
+    ungroup() %>%
+    mutate(term = case_when(term == "association_strengthWeak (1x)" ~ "Memory strength (Weak v. Strong)",
+                            term == "association_strengthWeak (1x):is_mismatch" ~ "Mismatch effect x Memory strength",
+                            term == "is_mismatch" ~ "Mismatch v. Match",
+                            term == "(Intercept)" ~ "Intercept",
+                            .default="")) %>%
+    dplyr::filter(term == this.term) %>%
+    ggplot(aes(x=as.numeric(as.character(time)),
+               y=estimate,
+               color=term,
+               fill=term)) +
+    geom_ribbon(aes(ymin=estimate-se, ymax=estimate+se),
+                color=NA,
+                alpha=0.3) +
+    geom_line(linewidth = 0.6, color=this.color) +
+    geom_vline(xintercept = c(0, 1, 2, 2.75),
+               linetype = "dashed",
+               color = "gray37") +
+    geom_hline(yintercept = c(0),
+               linetype = "longdash",
+               color = "gray37") +
+    # mark significant difference
+    geom_point(aes(x = time,
+                   y = ypos),
+               color = this.color,
+               show.legend = F,
+               data = pupil.results.betas %>%
+                 dplyr::filter(cluster_id == pupil.cluster),
+               size = 1) +
+    labs(x = "Time (s)",
+         y = paste("Pupil", greek.beta),
+         title = title) +
+    guides(color="none",
+           fill="none") +
+    facet_wrap(~term, ncol=1, scales="free_y", strip.position="top") +
+    scale_color_manual(values=c(this.color), name="") +
+    scale_fill_manual(values=c(this.color), name="") +
+    theme(strip.text.x = element_blank(),
+          axis.line.y=element_blank(),
+          axis.text.x=element_text(size=8.5),
+          axis.text.y=element_blank(),
+          axis.ticks.y=element_blank(),
+          axis.title = element_text(size=8.5),
+          strip.background=element_rect(colour=NA),
+          plot.title = element_text(size=8.5, hjust = 0.5))
+  
+  design <- "
+        ##########
+        ###2222222
+        ###2222222
+        ###2222222
+        1112222222
+        1112222222
+        ###2222222
+        #####333##
+        #####333##
+        "
+  
+  (pupil.beta.plt
+   +
+     binned.plt + # theme(plot.title = element_blank()) +
+     beta.plt +
+     plot_layout(design=design)) %>%
+    print()
+  
+  mod <- mod.data %>%
+    lmer(pupil_diameter_z ~ power * association_strength * trial_outcome +
+           (power * association_strength * trial_outcome | subjectId),
+         data = .)
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>%
+      lmer(pupil_diameter_z ~ power * association_strength * trial_outcome +
+             (power + association_strength + trial_outcome | subjectId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>%
+      lmer(pupil_diameter_z ~ power * association_strength * trial_outcome +
+             (1 | subjectId),
+           data = .)
+  }
+  
+  title <- formula(mod)[3]
+  
+  tidy(mod, effects = "fixed", conf.int = T, conf.level = 0.95) %>%
+    select(term, estimate, conf.low, conf.high, p.value, std.error, df) %>%
+    kable(caption=paste(this.comparison, ": ", title, sep=""),
+          digits=3) %>%
+    kable_styling() %>%
+    cat()
+  
+  tidy(mod, effects = "ran_pars", scales = "vcov") %>%
+    select(term, estimate) %>%
+    kable(digits=3, caption="Random effects") %>%
+    kable_styling() %>%
+    cat()
+  
+  slopes <- emtrends(mod, pairwise ~ association_strength * trial_outcome, var = "power")
+  
+  slopes %>% summary() %>% print()
+  
+  tidy(slopes$emtrends, conf.int = T, conf.level = 0.95) %>%
+    kable(caption=paste("slopes: pupil ~ ", title, sep=""),
+          digits=3) %>%
+    kable_styling() %>%
+    cat()
+  
+  tidy(slopes$contrasts, conf.int = T, conf.level = 0.95) %>%
+    select(contrast, estimate, std.error, df, conf.low, conf.high, statistic, adj.p.value) %>%
+    kable(caption=paste("slope contrasts: pupil ~ ", title, sep=""),
+          digits=3) %>%
+    kable_styling() %>%
+    cat()
+}
+
+```
+
+```{r echo=F, fig.width=5.2, fig.height=3, eval=F}
+for (fig in mean.pupil.plts) {
+  (fig + 
+     theme(plot.title=element_blank(),
+           legend.position = "none")) %>% 
+     print()
+}
+```
+
+# Power ~ pupil PC
+
+```{r load_pupil_pcs, echo=F, eval=T}
+pupil.pca.scores <- read.csv("../pupil/pupil_tPCA_scores_correct_trials_only.csv")
+pupil.pca.loadings <- read.csv("../pupil/pupil_tPCA_loadings_correct_trials_only.csv")
+
+# ordered by "peak time"
+ordered_pcs <- c("PC2",
+                 "PC5",
+                 "PC1",
+                 "PC6",
+                 "PC3",
+                 "PC4")
+```
+
+
+```{r get_loading_pc, echo=F, eval=T}
+
+get_pc_loading_plt <- function(pc) {
+  loading.plt <- pupil.pca.loadings %>%
+    dplyr::filter(component == pc) %>%
+    ggplot(aes(x = time,
+               y = loading,
+               color = component,
+               fill = component)) +
+    geom_line(color="black", linewidth=0.6) +
+    geom_vline(xintercept = c(0, 1, 2, 2.75),
+               linetype = "dashed",
+               color = "gray37") +
+    facet_wrap(~component) +
+    theme(legend.position = "none",
+          #strip.text.x = element_blank(),
+          strip.background = element_blank(),
+          strip.text.y = element_blank(),
+          #axis.line=element_blank(),
+          axis.text.x=element_blank(),
+          axis.text.y=element_blank(),
+          axis.ticks=element_blank(),
+          axis.title.x=element_blank(),
+          axis.title.y=element_blank())
+  
+  return (loading.plt)
+}
+
+```
+
+```{r pupil_pc, eval=T, echo=F, fig.width=8, fig.height=5, results="asis"}
+
+power.plus.pupil <- power.clusters %>%
+  group_by(subjectId, term, trialN, association_strength, trial_outcome,
+           !!sym(cluster_id.power), !!sym(start.name), !!sym(end.name),
+           power) %>%
+  summarize() %>%
+  ungroup() %>%
+  right_join(pupil.pca.scores,
+             suffix = c(".power", ".pupil_pc"),
+             multiple="all") %>%
+  mutate(trial_outcome = factor(trial_outcome, 
+                                levels=c("Hit", "Miss", "CR", "FA"))) %>%
+  dplyr::filter(!is.na(power))
+
+if (!exists("pc.pupil.models") | run_pupil_models) {
+  pc.pupil.models <- list()
+}
+
+all.binned.plts <- list()
+
+for (this.cluster in power.plus.pupil %>% pull(!!sym(cluster_id.power)) %>% unique()) {
+  all.pc.plts <- list()
+  all.pc.loading.plts <- list()
+  
+  if ((power_name == "frontal-theta" & this.cluster == 3) |
+      (power_name == "posterior-alpha" & this.cluster == 3) |
+      (power_name == "posterior-alpha" & this.cluster == 4)) {
+    
+    for (pc in c("PC1", "PC5")) {
+      loading.plt <- get_pc_loading_plt(pc)
+      
+      mod.data <- power.plus.pupil %>%
+        dplyr::filter(!!sym(cluster_id.power) == this.cluster) %>%
+        dplyr::filter(component == pc) %>%
+        mutate(trial_outcome = as.character(trial_outcome)) %>%
+        dplyr::filter(trial_outcome %in% c("Hit", "CR")) %>%
+        mutate(trial_outcome = recode(trial_outcome,
+                                      "Hit" = "Match",
+                                      "CR" = "Mismatch"))
+      
+      lm.plt <- mod.data %>%
+        group_by(subjectId, !!sym(cluster_id.power), component, association_strength, trial_outcome) %>%
+        mutate(trial_count = n()) %>%
+        ungroup() %>%
+        dplyr::filter(trial_count > nbins - 1) %>%
+        group_by(subjectId, !!sym(cluster_id.power), component, association_strength, trial_outcome) %>%
+        mutate(component_score_bin = cut_interval(component_score,
+                                                  n = nbins,
+                                                  labels = F)) %>%
+        ungroup() %>%
+        group_by(subjectId, !!sym(cluster_id.power), component_score_bin, trial_outcome, association_strength,
+                 component) %>%
+        summarize(power = mean(power)) %>%
+        ungroup() %>%
+        mutate(trial_outcome = as.character(trial_outcome)) %>%
+        mutate(trial_outcome=replace(trial_outcome, trial_outcome=="Hit", "Match")) %>%
+        mutate(trial_outcome=replace(trial_outcome, trial_outcome=="CR", "Mismatch")) %>%
+        dplyr::filter(trial_outcome %in% c("Match", "Mismatch")) %>%
+        summarySEwithin(.,
+                        measurevar="power",
+                        withinvars=c("association_strength",
+                                     "trial_outcome",
+                                     "component",
+                                     "component_score_bin"),
+                        idvar="subjectId") %>%
+        ggplot(aes(x = as.numeric(as.character(component_score_bin)),
+                   y = power,
+                   color = trial_outcome,
+                   fill = trial_outcome)) +
+        geom_line(linewidth=0.8) +
+        geom_point(size=1.5) +
+        geom_errorbar(aes(ymin=power-se, ymax=power+se),
+                      width=0.2) +
+        facet_grid(cols = vars(association_strength),
+                   scales = "free") +
+        scale_color_manual(values=c("#1a75ff", "#ff751a", "#1a75ff", "#ff751a"), name="") +
+        scale_fill_manual(values=c("#1a75ff", "#ff751a", "#1a75ff", "#ff751a"), name="") +
+        labs(x = paste(pc, "score quintile"), y = paste(y_axis_power_label, "(z)"),
+             title = paste("Power cluster:", this.cluster, sep=" "))
+      
+      this.term <- (mod.data %>% select(term) %>% unique())$term
+      if (this.term == "Mismatch v. Match") {
+        this.color <- "#9E0059"
+      } else if (this.term == "Memory strength (Weak v. Strong)") {
+        this.color <- "#1A936F"
+      } else {
+        this.color <- "#FFD131"
+      }
+      
+      all.binned.plts[[length(all.binned.plts)+1]] <- lm.plt
+      all.pc.plts[[pc]] <- lm.plt
+      all.pc.loading.plts[[pc]] <- loading.plt
+      
+      design <- "
+        ######
+        ##2222
+        112222
+        112222
+        112222
+        ##2222
+        ###33#
+        ###33#
+        ###33#
+        "
+      
+      beta.plt <- betas.df %>%
+        dplyr::filter(term == as.character(this.term)) %>%
+        ggplot(aes(x=as.numeric(as.character(time)),
+                   y=estimate,
+                   color=term,
+                   fill=term)) +
+        geom_ribbon(aes(ymin=estimate-se, ymax=estimate+se),
+                    color=NA,
+                    alpha=0.3) +
+        geom_line(linewidth = 0.6, color=this.color) +
+        geom_vline(xintercept = c(0, 1, 2, 2.75),
+                   linetype = "dashed",
+                   color = "gray37") +
+        geom_hline(yintercept = c(0),
+                   linetype = "longdash",
+                   color = "gray37") +
+        # mark significant difference
+        geom_point(aes(x = time,
+                       y = ypos),
+                   color = this.color,
+                   show.legend = F,
+                   data = results.betas %>%
+                     dplyr::filter(cluster_id == this.cluster),
+                   size = 1) +
+        labs(x = "Time (s)",
+             y = paste("Power", greek.beta),
+             title = "Strength") +
+        guides(color="none",
+               fill="none") +
+        facet_wrap(~term, ncol=1, scales="free_y", strip.position="top") +
+        scale_color_manual(values=this.color, name="") +
+        scale_fill_manual(values=this.color, name="") +
+        theme(strip.text.x = element_blank(),
+              axis.line.y=element_blank(),
+              axis.text.x=element_text(size=8.5),
+              axis.text.y=element_blank(),
+              axis.ticks.y=element_blank(),
+              axis.title = element_text(size=8.5),
+              strip.background=element_rect(colour=NA),
+              plot.title = element_text(size=8.5, hjust = 0.5))
+      
+      
+      (beta.plt +
+          all.pc.plts[[pc]] + theme(plot.title = element_blank()) +
+          all.pc.loading.plts[[pc]] +
+          plot_layout(design=design, guides="collect", axes="collect") &
+          theme()) %>%
+        print()
+      
+      title <- paste("Cluster: ", this.cluster, "; ", pc, sep="")
+      
+      if (title %in% names(pc.pupil.models)) {
+        mod <- pc.pupil.models[[title]]
+      } else {
+        mod <- mod.data %>%
+          lmer(power ~ component_score * association_strength * trial_outcome +
+                 (component_score * association_strength * trial_outcome | subjectId),
+               data = .)
+        
+        if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+          mod <- mod.data %>%
+            lmer(power ~ component_score * association_strength * trial_outcome +
+                   (component_score + association_strength + trial_outcome | subjectId),
+                 data = .)
+        }
+        
+        if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+          mod <- mod.data %>%
+            lmer(power ~ component_score * association_strength * trial_outcome +
+                   (1 | subjectId),
+                 data = .)
+        }
+        
+        pc.pupil.models[[title]] <- mod
+      }
+      
+      title <- formula(mod)[3]
+      
+      tidy(mod, effects = "fixed", conf.int = T, conf.level = 0.95) %>%
+        select(term, estimate, conf.low, conf.high, p.value, std.error, df) %>%
+        kable(caption=paste(pc, ": ", title, sep=""),
+              digits=3) %>%
+        kable_styling() %>%
+        cat()
+      
+      tidy(mod, effects = "ran_pars", scales = "vcov") %>%
+        select(term, estimate) %>%
+        kable(digits=3, caption="Random effects") %>%
+        kable_styling() %>%
+        cat()
+      
+      slopes <- emtrends(mod, pairwise ~ association_strength * trial_outcome, var = "component_score")
+      
+      print("Degrees-of-freedom method: asymptotic P value adjustment: tukey method for comparing a family of 4 estimates")
+      
+      tidy(slopes$emtrends, conf.int = T, conf.level = 0.95) %>%
+        kable(caption=paste("slopes: PC ~ ", title, sep=""),
+              digits=3) %>%
+        kable_styling() %>%
+        cat()
+      
+      tidy(slopes$contrasts, conf.int = T, conf.level = 0.95) %>%
+        select(contrast, estimate, std.error, df, conf.low, conf.high, statistic, adj.p.value) %>%
+        kable(caption=paste("slope contrasts: PC ~ ", title, sep=""),
+              digits=3) %>%
+        kable_styling() %>%
+        cat()
+      
+    }
+    
+    
+    # cognitive effort and memory reinstatement
+    if ((power_name == "frontal-theta" & this.cluster == 3) |
+        (power_name == "posterior-alpha" & this.cluster == 3) |
+        (power_name == "posterior-alpha" & this.cluster == 4)) {
+      
+      design <- "
+      ##########
+      ##########
+      ##########
+      ##########
+      ##22224444
+      ##22224444
+      1122224444
+      1122224444
+      ##22224444
+      ###33##55#
+      ###33##55#
+    "
+      
+      beta.plt <- betas.df %>%
+        dplyr::filter(term == "Memory strength (Weak v. Strong)") %>%
+        ggplot(aes(x=as.numeric(as.character(time)),
+                   y=estimate,
+                   color=term,
+                   fill=term)) +
+        geom_ribbon(aes(ymin=estimate-se, ymax=estimate+se),
+                    color=NA,
+                    alpha=0.3) +
+        geom_line(linewidth = 0.6, color=this.color) +
+        geom_vline(xintercept = c(0, 1, 2, 2.75),
+                   linetype = "dashed",
+                   color = "gray37") +
+        geom_hline(yintercept = c(0),
+                   linetype = "longdash",
+                   color = "gray37") +
+        # mark significant difference
+        geom_point(aes(x = time,
+                       y = ypos),
+                   color = this.color,
+                   show.legend = F,
+                   data = results.betas %>%
+                     dplyr::filter(cluster_id == this.cluster),
+                   size = 1) +
+        labs(x = "Time (s)",
+             y = paste("Power", greek.beta),
+             title = "Strength") +
+        guides(color="none",
+               fill="none") +
+        facet_wrap(~term, ncol=1, scales="free_y", strip.position="top") +
+        scale_color_manual(values=beta_palette[3], name="") +
+        scale_fill_manual(values=beta_palette[3], name="") +
+        theme(strip.text.x = element_blank(),
+              axis.line.y=element_blank(),
+              axis.text.x=element_text(size=8.5),
+              axis.text.y=element_blank(),
+              axis.ticks.y=element_blank(),
+              axis.title = element_text(size=8.5),
+              strip.background=element_rect(colour=NA),
+              plot.title = element_text(size=8.5, hjust = 0.5))
+      
+      
+      (beta.plt +
+          all.pc.plts[["PC1"]] + theme(plot.title = element_blank()) +
+          all.pc.loading.plts[["PC1"]] +
+          all.pc.plts[["PC5"]] + theme(plot.title = element_blank()) +
+          all.pc.loading.plts[["PC5"]] +
+          guides(color=guide_legend(nrow=1)) +
+          plot_layout(design=design, guides="collect", axes="collect") &
+          theme(legend.position = "top")) %>%
+        print()
+      
+    }
+    
+  }
+}
+
+```
+
+```{r echo=F, fig.width=5.2, fig.height=3, eval=F}
+for (fig in all.binned.plts) {
+  (fig + 
+     theme(plot.title=element_blank(),
+           legend.position = "none")) %>% 
+     print()
+}
+```
+
+## PC ~ power
+
+```{r pc_power, eval=T, echo=F, fig.width=10, fig.height=5, results="asis"}
+
+all.pc.plts <- list()
+
+if (power_name == "frontal-theta") {
+  clusters.of.interest <- c(3)
+} else if (power_name == "posterior-alpha") {
+  clusters.of.interest <- c(3, 4)
+}
+
+for (this.cluster in clusters.of.interest) {
+  for (pc in c("PC1", "PC5")) {
+    loading.plt <- get_pc_loading_plt(pc)
+    
+    mod.data <- power.plus.pupil %>%
+      dplyr::filter(!!sym(cluster_id.power) == this.cluster) %>%
+      dplyr::filter(component == pc) %>%
+      mutate(trial_outcome = as.character(trial_outcome)) %>%
+      dplyr::filter(trial_outcome %in% c("Hit", "CR")) %>%
+      mutate(trial_outcome = recode(trial_outcome,
+                                    "Hit" = "Match",
+                                    "CR" = "Mismatch"))
+    
+    lm.plt <- mod.data %>%
+      group_by(subjectId, !!sym(cluster_id.power), component, association_strength, trial_outcome) %>%
+      mutate(trial_count = n()) %>%
+      ungroup() %>%
+      dplyr::filter(trial_count > nbins - 1) %>%
+      group_by(subjectId, !!sym(cluster_id.power), component, association_strength, trial_outcome) %>%
+      mutate(power_bin = cut_interval(power,
+                                      n = nbins,
+                                      labels = F)) %>%
+      ungroup() %>%
+      group_by(subjectId, !!sym(cluster_id.power), power_bin, trial_outcome, association_strength,
+               component) %>%
+      summarize(component_score = mean(component_score)) %>%
+      ungroup() %>%
+      mutate(trial_outcome = as.character(trial_outcome)) %>%
+      mutate(trial_outcome=replace(trial_outcome, trial_outcome=="Hit", "Match")) %>%
+      mutate(trial_outcome=replace(trial_outcome, trial_outcome=="CR", "Mismatch")) %>%
+      dplyr::filter(trial_outcome %in% c("Match", "Mismatch")) %>%
+      summarySEwithin(.,
+                      measurevar="component_score",
+                      withinvars=c("association_strength",
+                                   "trial_outcome",
+                                   "component",
+                                   "power_bin"),
+                      idvar="subjectId") %>%
+      ggplot(aes(x = as.numeric(as.character(power_bin)),
+                 y = component_score,
+                 color = trial_outcome,
+                 fill = trial_outcome)) +
+      geom_line(linewidth=0.8) +
+      geom_point(size=1.5) +
+      geom_errorbar(aes(ymin=component_score-se, ymax=component_score+se),
+                    width=0.2) +
+      facet_grid(cols = vars(association_strength),
+                 scales = "free") +
+      scale_color_manual(values=c("#1a75ff", "#ff751a", "#1a75ff", "#ff751a"), name="") +
+      scale_fill_manual(values=c("#1a75ff", "#ff751a", "#1a75ff", "#ff751a"), name="") +
+      labs(y = paste(pc, "score"), x = paste(y_axis_power_label, "quintile"),
+           title = paste("Power cluster:", this.cluster, sep=" "))
+    
+    all.pc.plts[[pc]] <- lm.plt
+    all.pc.loading.plts[[pc]] <- loading.plt
+    
+    this.term <- (mod.data %>% select(term) %>% unique())$term
+    if (this.term == "Mismatch v. Match") {
+      this.color <- "#9E0059"
+    } else if (this.term == "Memory strength (Weak v. Strong)") {
+      this.color <- "#1A936F"
+    } else {
+      this.color <- "#FFD131"
+    }
+    
+    design <- "
+    ######
+    ##2222
+    112222
+    112222
+    112222
+    ##2222
+    ###33#
+    ###33#
+    ###33#
+    "
+    
+    beta.plt <- betas.df %>%
+      dplyr::filter(term == "Memory strength (Weak v. Strong)") %>%
+      ggplot(aes(x=as.numeric(as.character(time)),
+                 y=estimate,
+                 color=term,
+                 fill=term)) +
+      geom_ribbon(aes(ymin=estimate-se, ymax=estimate+se),
+                  color=NA,
+                  alpha=0.3) +
+      geom_line(linewidth = 0.6, color=this.color) +
+      geom_vline(xintercept = c(0, 1, 2, 2.75),
+                 linetype = "dashed",
+                 color = "gray37") +
+      geom_hline(yintercept = c(0),
+                 linetype = "longdash",
+                 color = "gray37") +
+      # mark significant difference
+      geom_point(aes(x = time,
+                     y = ypos),
+                 color = this.color,
+                 show.legend = F,
+                 data = results.betas %>%
+                   dplyr::filter(cluster_id == this.cluster),
+                 size = 1) +
+      labs(x = "Time (s)",
+           y = paste("Power", greek.beta),
+           title = "Strength") +
+      guides(color="none",
+             fill="none") +
+      facet_wrap(~term, ncol=1, scales="free_y", strip.position="top") +
+      scale_color_manual(values=beta_palette[3], name="") +
+      scale_fill_manual(values=beta_palette[3], name="") +
+      theme(strip.text.x = element_blank(),
+            axis.line.y=element_blank(),
+            axis.text.x=element_text(size=8.5),
+            axis.text.y=element_blank(),
+            axis.ticks.y=element_blank(),
+            axis.title = element_text(size=8.5),
+            strip.background=element_rect(colour=NA),
+            plot.title = element_text(size=8.5, hjust = 0.5))
+    
+    (all.pc.loading.plts[[pc]] +
+        all.pc.plts[[pc]] + theme(plot.title = element_blank()) +
+        beta.plt +
+        plot_layout(design=design, guides="collect", axes="collect") &
+        theme()) %>%
+      print()
+    
+    title <- paste("Cluster: ", this.cluster, "; ", pc, sep="")
+    
+    mod <- mod.data %>%
+      lmer(component_score ~ power * association_strength * trial_outcome +
+             (power * association_strength * trial_outcome | subjectId),
+           data = .)
+    
+    if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+      mod <- mod.data %>%
+        lmer(component_score ~ power * association_strength * trial_outcome +
+               (power + association_strength + trial_outcome | subjectId),
+             data = .)
+    }
+    
+    if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+      mod <- mod.data %>%
+        lmer(component_score ~ power * association_strength * trial_outcome +
+               (1 | subjectId),
+             data = .)
+    }
+    
+    title <- formula(mod)[3]
+    
+    tidy(mod, effects = "fixed", conf.int = T, conf.level = 0.95) %>%
+      select(term, estimate, conf.low, conf.high, p.value, std.error, df) %>%
+      kable(caption=paste(pc, ": ", title, sep=""),
+            digits=3) %>%
+      kable_styling() %>%
+      cat()
+    
+    tidy(mod, effects = "ran_pars", scales = "vcov") %>%
+      select(term, estimate) %>%
+      kable(digits=3, caption="Random effects") %>%
+      kable_styling() %>%
+      cat()
+    
+    slopes <- emtrends(mod, pairwise ~ association_strength * trial_outcome, var = "power")
+    
+    print("Degrees-of-freedom method: asymptotic P value adjustment: tukey method for comparing a family of 4 estimates")
+    
+    tidy(slopes$emtrends, conf.int = T, conf.level = 0.95) %>%
+      kable(caption=paste("slopes: PC ~ ", title, sep=""),
+            digits=3) %>%
+      kable_styling() %>%
+      cat()
+    
+    tidy(slopes$contrasts, conf.int = T, conf.level = 0.95) %>%
+      select(contrast, estimate, std.error, df, conf.low, conf.high, statistic, adj.p.value) %>%
+      kable(caption=paste("slope contrasts: PC ~ ", title, sep=""),
+            digits=3) %>%
+      kable_styling() %>%
+      cat()
+    
+  }
+  
+  design <- "
+      ############
+      ############
+      ############
+      ############
+      ##2222##4444
+      ##2222##4444
+      112222664444
+      112222664444
+      ##2222##4444
+      ###33####55#
+      ###33####55#
+    "
+  
+  beta.plt <- betas.df %>%
+    dplyr::filter(term == "Memory strength (Weak v. Strong)") %>%
+    ggplot(aes(x=as.numeric(as.character(time)),
+               y=estimate,
+               color=term,
+               fill=term)) +
+    geom_ribbon(aes(ymin=estimate-se, ymax=estimate+se),
+                color=NA,
+                alpha=0.3) +
+    geom_line(linewidth = 0.6, color=this.color) +
+    geom_vline(xintercept = c(0, 1, 2, 2.75),
+               linetype = "dashed",
+               color = "gray37") +
+    geom_hline(yintercept = c(0),
+               linetype = "longdash",
+               color = "gray37") +
+    # mark significant difference
+    geom_point(aes(x = time,
+                   y = ypos),
+               color = this.color,
+               show.legend = F,
+               data = results.betas %>%
+                 dplyr::filter(cluster_id == this.cluster),
+               size = 1) +
+    labs(x = "Time (s)",
+         y = paste("Power", greek.beta),
+         title = "Strength") +
+    guides(color="none",
+           fill="none") +
+    facet_wrap(~term, ncol=1, scales="free_y", strip.position="top") +
+    scale_color_manual(values=beta_palette[3], name="") +
+    scale_fill_manual(values=beta_palette[3], name="") +
+    theme(strip.text.x = element_blank(),
+          axis.line.y=element_blank(),
+          axis.text.x=element_text(size=8.5),
+          axis.text.y=element_blank(),
+          axis.ticks.y=element_blank(),
+          axis.title = element_text(size=8.5),
+          strip.background=element_rect(colour=NA),
+          plot.title = element_text(size=8.5, hjust = 0.5))
+  
+  
+  (all.pc.loading.plts[["PC1"]] +
+      all.pc.plts[["PC1"]] + theme(plot.title = element_blank()) +
+      beta.plt +
+      all.pc.plts[["PC5"]] + theme(plot.title = element_blank()) +
+      beta.plt +
+      all.pc.loading.plts[["PC5"]] +
+      guides(color=guide_legend(nrow=1)) +
+      plot_layout(design=design, guides="collect", axes="collect") &
+      theme(legend.position = "top")) %>%
+    print()
+}
+
+```
+
+```{r echo=F, fig.width=5.2, fig.height=3, eval=F}
+for (fig in all.pc.plts) {
+  (fig + 
+     theme(plot.title=element_blank(),
+           legend.position = "none")) %>% 
+     print()
+}
+```
+
+# Strong only
+
+## Power ~ pupil
+
+```{r strong_power_pupil, echo=F, fig.width=7, results="asis", eval=T}
+
+nbins <- 5
+
+ymin.pupil <- -0.4
+ymax.pupil <- 0.5
+
+if (power_name == "frontal-theta") {
+  ymin.power <- -0.2
+  ymax.power <- 0.6
+} else if (power_name == "posterior-alpha") {
+  ymin.power <- -0.5
+  ymax.power <- 0.5
+}
+
+mean.pupil.plts <- list()
+
+if (power_name == "frontal-theta") {
+  comparisons.of.interest <- c("Mismatch effect x Memory strength \npupil 4 v. power 7")
+} else if (power_name == "posterior-alpha") {
+  comparisons.of.interest <- c("Mismatch effect x Memory strength \npupil 4 v. power 8")
+}
+
+for (this.comparison in comparisons.of.interest) {
+  mod.data <- pupil.power.data %>% 
+    dplyr::filter(comparison == this.comparison) %>% 
+    dplyr::filter(!is.na(power)) %>% 
+    dplyr::filter(!is.na(pupil_diameter_z)) %>% 
+    mutate(trial_outcome = as.character(trial_outcome)) %>% 
+    dplyr::filter(association_strength == "Strong (4x)") %>% 
+    dplyr::filter(trial_outcome %in% c("Hit", "CR")) %>% 
+    mutate(trial_outcome = recode(trial_outcome, 
+                                  "Hit" = "Match",
+                                  "CR" = "Mismatch"))
+  
+  binned.plt <- mod.data %>% 
+    group_by(subjectId, trial_outcome, association_strength) %>%
+    mutate(trial_count = n()) %>%
+    ungroup() %>%
+    dplyr::filter(trial_count > nbins-1) %>%
+    group_by(subjectId, trial_outcome, association_strength) %>%
+    mutate(pupil_bin = cut_interval(pupil_diameter_z, 
+                                    n = nbins,
+                                    labels = F)) %>% 
+    ungroup() %>% 
+    group_by(subjectId, trial_outcome, association_strength, pupil_bin) %>% 
+    summarize(power = mean(power)) %>% 
+    summarySEwithin(., 
+                    measurevar="power", 
+                    withinvars=c("association_strength",
+                                 "trial_outcome",
+                                 "pupil_bin"), 
+                    idvar="subjectId") %>% 
+    ggplot(aes(x = as.numeric(as.character(pupil_bin)),
+               y = power,
+               color = trial_outcome,
+               fill = trial_outcome)) +
+    geom_line(linewidth=0.8) +
+    geom_point(size=1.5) +
+    geom_errorbar(aes(ymin=power-se, ymax=power+se),
+                  width=0.2) +
+    scale_color_manual(values=c("#1a75ff", "#ff751a"), name="") + 
+    scale_fill_manual(values=c("#1a75ff", "#ff751a"), name="") + 
+    facet_grid(cols=vars(association_strength)) +
+    labs(x = "Pupil diameter quintile", y = paste(y_axis_power_label, "(z)"),
+         title=this.comparison)
+  
+  mean.pupil.plts[[this.comparison]] <- binned.plt
+  
+  this.term <- (mod.data %>% select(term) %>% unique())$term
+  if (this.term == "Mismatch v. Match") {
+    this.color <- "#9E0059"
+  } else if (this.term == "Memory strength (Weak v. Strong)") {
+    this.color <- "#1A936F"
+  } else {
+    this.color <- "#FFD131"
+  }
+  
+  if (this.comparison == "Mismatch effect x Memory strength \npupil 4 v. power 7") {
+    pupil.cluster <- 4
+    power.cluster <- 7
+    this.term <- "Mismatch effect x Memory strength"
+    title <- "Mismatch x Strength"
+  }
+  if (this.comparison == "Mismatch effect x Memory strength \npupil 4 v. power 8") {
+    pupil.cluster <- 4
+    power.cluster <- 8
+    this.term <- "Mismatch effect x Memory strength"
+    title <- "Mismatch x Strength"
+  }
+  
+  beta.plt <- betas.df %>% 
+    dplyr::filter(term == this.term) %>% 
+    ggplot(aes(x=as.numeric(as.character(time)), 
+               y=estimate,
+               color=term,
+               fill=term)) + 
+    geom_ribbon(aes(ymin=estimate-se, ymax=estimate+se),
+                color=NA,
+                fill=this.color,
+                alpha=0.3) +
+    geom_line(linewidth = 0.6, color=this.color) +
+    geom_vline(xintercept = c(0, 1, 2, 2.75),
+               linetype = "dashed",
+               color = "gray37") +
+    geom_hline(yintercept = c(0),
+               linetype = "longdash",
+               color = "gray37") +
+    # mark significant difference
+    geom_point(aes(x = time,
+                   y = ypos),
+               color=this.color,
+               show.legend = F,
+               data = results.betas %>% 
+                 dplyr::filter(cluster_id == power.cluster),
+               size = 1) +
+    labs(x = "Time (s)",
+         y = paste("Power", greek.beta),
+         title = title) +
+    guides(color="none",
+           fill="none") + 
+    facet_wrap(~term, ncol=1, scales="free_y", strip.position="top") +
+    theme(strip.text.x = element_blank(),
+          axis.line.y=element_blank(),
+          axis.text.x=element_text(size=8.5),
+          axis.text.y=element_blank(),
+          axis.ticks.y=element_blank(),
+          axis.title = element_text(size=8.5),
+          strip.background=element_rect(colour=NA),
+          plot.title = element_text(size=8.5, hjust = 0.5))
+  
+  pupil.beta.plt <- pupil.betas %>% 
+    group_by(time, term) %>% 
+    summarize(se = sd(estimate) / sqrt(sum(!is.na(estimate))),
+              estimate = mean(estimate)) %>% 
+    ungroup() %>% 
+    mutate(term = case_when(term == "association_strengthWeak (1x)" ~ "Memory strength (Weak v. Strong)",
+                            term == "association_strengthWeak (1x):is_mismatch" ~ "Mismatch effect x Memory strength",
+                            term == "is_mismatch" ~ "Mismatch v. Match",
+                            term == "(Intercept)" ~ "Intercept",
+                            .default="")) %>% 
+    dplyr::filter(term == this.term) %>% 
+    ggplot(aes(x=as.numeric(as.character(time)), 
+               y=estimate,
+               color=term,
+               fill=term)) + 
+    geom_ribbon(aes(ymin=estimate-se, ymax=estimate+se),
+                color=NA,
+                alpha=0.3) +
+    geom_line(linewidth = 0.6, color=this.color) +
+    geom_vline(xintercept = c(0, 1, 2, 2.75),
+               linetype = "dashed",
+               color = "gray37") +
+    geom_hline(yintercept = c(0),
+               linetype = "longdash",
+               color = "gray37") +
+    # mark significant difference
+    geom_point(aes(x = time,
+                   y = ypos),
+               color = this.color,
+               show.legend = F,
+               data = pupil.results.betas %>% 
+                 dplyr::filter(cluster_id == pupil.cluster),
+               size = 1) +
+    labs(x = "Time (s)",
+         y = paste("Pupil", greek.beta),
+         title = title) +
+    guides(color="none",
+           fill="none") + 
+    facet_wrap(~term, ncol=1, scales="free_y", strip.position="top") +
+    scale_color_manual(values=c(this.color), name="") + 
+    scale_fill_manual(values=c(this.color), name="") + 
+    theme(strip.text.x = element_blank(),
+          axis.line.y=element_blank(),
+          axis.text.x=element_text(size=8.5),
+          axis.text.y=element_blank(),
+          axis.ticks.y=element_blank(),
+          axis.title = element_text(size=8.5),
+          strip.background=element_rect(colour=NA),
+          plot.title = element_text(size=8.5, hjust = 0.5))
+  
+  design <- "
+        ###2222222
+        1112222222
+        1112222222
+        ###2222222
+        #####333##
+        #####333##
+        "
+  
+  (
+    beta.plt + 
+      binned.plt + # theme(plot.title = element_blank()) +
+      pupil.beta.plt + 
+      plot_layout(design=design)) %>% 
+    print()
+  
+  mean.pupil.beta.plts[[this.comparison]] <- pupil.beta.plt
+  
+  mod <- mod.data %>%
+    mutate(trial_outcome = factor(trial_outcome, 
+                                  levels=c("Match", "Mismatch"))) %>%
+    lmer(power ~ pupil_diameter_z * trial_outcome +
+           (pupil_diameter_z * trial_outcome | subjectId),
+         data = .)
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>%
+      mutate(trial_outcome = factor(trial_outcome, 
+                                    levels=c("Match", "Mismatch"))) %>%
+      lmer(power ~ pupil_diameter_z * trial_outcome +
+             (pupil_diameter_z + trial_outcome | subjectId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>%
+      mutate(trial_outcome = factor(trial_outcome, 
+                                    levels=c("Match", "Mismatch"))) %>%
+      lmer(power ~ pupil_diameter_z * trial_outcome +
+             (pupil_diameter_z | subjectId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>%
+      mutate(trial_outcome = factor(trial_outcome, 
+                                    levels=c("Match", "Mismatch"))) %>%
+      lmer(power ~ pupil_diameter_z * trial_outcome +
+             (1 | subjectId),
+           data = .)
+  }
+  
+  title <- formula(mod)[3]
+  
+  tidy(mod, effects = "fixed", conf.int = T, conf.level = 0.95) %>% 
+    select(term, estimate, conf.low, conf.high, p.value, std.error, df) %>% 
+    kable(caption=paste(this.comparison, ": ", title, sep=""),
+          digits=3) %>% 
+    kable_styling() %>% 
+    cat()
+  
+  tidy(mod, effects = "ran_pars", scales = "vcov") %>% 
+    select(term, estimate) %>% 
+    kable(digits=3, caption="Random effects") %>% 
+    kable_styling() %>% 
+    cat()
+}
+
+```
+
+```{r echo=F, fig.width=3, fig.height=2.8, eval=F}
+for (fig in mean.pupil.plts) {
+  (fig + 
+     theme(plot.title=element_blank(),
+           legend.position = "none")) %>% 
+     print()
+}
+```
+
+### Retrieval-MPE interactions (power ~ pupil)
+
+```{r strong_power_pupil_ret_mpe, echo=F, fig.width=7, results="asis", eval=T}
+
+nbins <- 5
+
+ymin.pupil <- -0.4
+ymax.pupil <- 0.5
+
+if (power_name == "frontal-theta") {
+  ymin.power <- -0.2
+  ymax.power <- 0.6
+} else if (power_name == "posterior-alpha") {
+  ymin.power <- -0.5
+  ymax.power <- 0.5
+}
+
+mean.pupil.plts <- list()
+
+for (this.comparison in interaction.MPE.data %>% pull(comparison) %>% unique()) {
+  mod.data <- interaction.MPE.data %>% 
+    dplyr::filter(comparison == this.comparison) %>% 
+    dplyr::filter(!is.na(power)) %>% 
+    dplyr::filter(!is.na(pupil_diameter_z)) %>% 
+    mutate(trial_outcome = as.character(trial_outcome)) %>% 
+    dplyr::filter(association_strength == "Strong (4x)") %>% 
+    dplyr::filter(trial_outcome %in% c("Hit", "CR")) %>% 
+    mutate(trial_outcome = recode(trial_outcome, 
+                                  "Hit" = "Match",
+                                  "CR" = "Mismatch"))
+  
+  binned.plt <- mod.data %>% 
+    group_by(subjectId, trial_outcome, association_strength) %>%
+    mutate(trial_count = n()) %>%
+    ungroup() %>%
+    dplyr::filter(trial_count > nbins-1) %>%
+    group_by(subjectId, trial_outcome, association_strength) %>%
+    mutate(pupil_bin = cut_interval(pupil_diameter_z, 
+                                    n = nbins,
+                                    labels = F)) %>% 
+    ungroup() %>% 
+    group_by(subjectId, trial_outcome, association_strength, pupil_bin) %>% 
+    summarize(power = mean(power)) %>% 
+    summarySEwithin(., 
+                    measurevar="power", 
+                    withinvars=c("association_strength",
+                                 "trial_outcome",
+                                 "pupil_bin"), 
+                    idvar="subjectId") %>% 
+    ggplot(aes(x = as.numeric(as.character(pupil_bin)),
+               y = power,
+               color = trial_outcome,
+               fill = trial_outcome)) +
+    geom_line(linewidth=0.8) +
+    geom_point(size=1.5) +
+    geom_errorbar(aes(ymin=power-se, ymax=power+se),
+                  width=0.2) +
+    scale_color_manual(values=c("#1a75ff", "#ff751a"), name="") + 
+    scale_fill_manual(values=c("#1a75ff", "#ff751a"), name="") + 
+    facet_grid(cols=vars(association_strength)) +
+    labs(x = "Pupil diameter quintile", y = paste(y_axis_power_label, "(z)"),
+         title=this.comparison)
+  
+  mean.pupil.plts[[this.comparison]] <- binned.plt
+  
+  design <- "
+    ##2222
+    112222
+    112222
+    112222
+    ##2222
+    ###33#
+    ###33#
+    ###33#
+  "
+  
+  this.term.pupil <- (mod.data %>% pull(term.pupil) %>% unique())[1]
+  if (this.term.pupil == "Mismatch v. Match") {
+    this.color.pupil <- "#9E0059"
+  } else if (this.term.pupil == "Memory strength (Weak v. Strong)") {
+    this.color.pupil <- "#1A936F"
+  } else {
+    this.color.pupil <- "#FFD131"
+  }
+  
+  this.term.power <- (mod.data %>% pull(term.power) %>% unique())[1]
+  if (this.term.power == "Mismatch v. Match") {
+    this.color.power <- "#9E0059"
+  } else if (this.term.power == "Memory strength (Weak v. Strong)") {
+    this.color.power <- "#1A936F"
+  } else {
+    this.color.power <- "#FFD131"
+  }
+  
+  power.lims <- mod.data %>% select(!!sym(start.name), !!sym(end.name)) %>% unique()
+  pupil.lims <- mod.data %>% select(start.pupil, end.pupil) %>% unique()
+  
+  power.cluster_id <- mod.data %>% pull(!!sym(cluster_id.power)) %>% unique()
+  pupil.cluster_id <- mod.data %>% pull(cluster_id.pupil) %>% unique()
+  
+  if (this.term.power == "Mismatch v. Match") {
+    power.title <- "Mismatch"
+  } else if (this.term.power == "Memory strength (Weak v. Strong)") {
+    power.title <- "Strength"
+  } else if (this.term.power == "Mismatch effect x Memory strength") {
+    power.title <- "Mismatch x Strength"
+  }
+  
+  if (this.term.pupil == "Mismatch v. Match") {
+    pupil.title <- "Mismatch"
+  } else if (this.term.power == "Memory strength (Weak v. Strong)") {
+    pupil.title <- "Strength"
+  } else if (this.term.power == "Mismatch effect x Memory strength") {
+    pupil.title <- "Mismatch x Strength"
+  }
+  
+  beta.plt <- betas.df %>% 
+    dplyr::filter(as.character(term) == as.character(this.term.power)) %>% 
+    ggplot(aes(x=as.numeric(as.character(time)), 
+               y=estimate,
+               color=term,
+               fill=term)) + 
+    geom_ribbon(aes(ymin=estimate-se, ymax=estimate+se),
+                color=NA,
+                fill=this.color.power,
+                alpha=0.3) +
+    geom_line(linewidth = 0.6, color=this.color.power) +
+    geom_vline(xintercept = c(0, 1, 2, 2.75),
+               linetype = "dashed",
+               color = "gray37") +
+    geom_hline(yintercept = c(0),
+               linetype = "longdash",
+               color = "gray37") +
+    # mark significant difference
+    geom_point(aes(x = time,
+                   y = ypos),
+               color=this.color.power,
+               show.legend = F,
+               data = results.betas %>% 
+                 dplyr::filter(cluster_id == power.cluster_id),
+               size = 1) +
+    labs(x = "Time (s)",
+         y = paste("Power", greek.beta),
+         title = power.title) +
+    guides(color="none",
+           fill="none") + 
+    facet_wrap(~term, ncol=1, scales="free_y", strip.position="top") +
+    theme(strip.text.x = element_blank(),
+          axis.line.y=element_blank(),
+          axis.text.x=element_text(size=8.5),
+          axis.text.y=element_blank(),
+          axis.ticks.y=element_blank(),
+          axis.title = element_text(size=8.5),
+          strip.background=element_rect(colour=NA),
+          plot.title = element_text(size=8.5, hjust = 0.5))
+  
+  pupil.beta.plt <- pupil.betas %>% 
+    group_by(time, term) %>% 
+    summarize(se = sd(estimate) / sqrt(sum(!is.na(estimate))),
+              estimate = mean(estimate)) %>% 
+    ungroup() %>% 
+    mutate(term = case_when(term == "association_strengthWeak (1x)" ~ "Memory strength (Weak v. Strong)",
+                            term == "association_strengthWeak (1x):is_mismatch" ~ "Mismatch effect x Memory strength",
+                            term == "is_mismatch" ~ "Mismatch v. Match",
+                            term == "(Intercept)" ~ "Intercept",
+                            .default="")) %>% 
+    dplyr::filter(term == this.term.pupil) %>% 
+    ggplot(aes(x=as.numeric(as.character(time)), 
+               y=estimate,
+               color=term,
+               fill=term)) + 
+    geom_ribbon(aes(ymin=estimate-se, ymax=estimate+se),
+                color=NA,
+                alpha=0.3) +
+    geom_line(linewidth = 0.6, color=this.color.pupil) +
+    geom_vline(xintercept = c(0, 1, 2, 2.75),
+               linetype = "dashed",
+               color = "gray37") +
+    geom_hline(yintercept = c(0),
+               linetype = "longdash",
+               color = "gray37") +
+    # mark significant difference
+    geom_point(aes(x = time,
+                   y = ypos),
+               color = this.color.pupil,
+               show.legend = F,
+               data = pupil.results.betas %>% 
+                 dplyr::filter(cluster_id == pupil.cluster_id),
+               size = 1) +
+    labs(x = "Time (s)",
+         y = paste("Pupil", greek.beta),
+         title = pupil.title) +
+    guides(color="none",
+           fill="none") + 
+    facet_wrap(~term, ncol=1, scales="free_y", strip.position="top") +
+    scale_color_manual(values=c(this.color.pupil), name="") + 
+    scale_fill_manual(values=c(this.color.pupil), name="") + 
+    theme(strip.text.x = element_blank(),
+          axis.line.y=element_blank(),
+          axis.text.x=element_text(size=8.5),
+          axis.text.y=element_blank(),
+          axis.ticks.y=element_blank(),
+          axis.title = element_text(size=8.5),
+          strip.background=element_rect(colour=NA),
+          plot.title = element_text(size=8.5, hjust = 0.5))
+  
+  design <- "
+        ###2222222
+        1112222222
+        1112222222
+        ###2222222
+        #####333##
+        #####333##
+        "
+  
+  (
+    beta.plt + 
+      binned.plt + # theme(plot.title = element_blank()) +
+      pupil.beta.plt + 
+      plot_layout(design=design)) %>% 
+    print()
+  
+  mod <- mod.data %>%
+    mutate(trial_outcome = factor(trial_outcome, 
+                                  levels=c("Match", "Mismatch"))) %>%
+    lmer(power ~ pupil_diameter_z * trial_outcome +
+           (pupil_diameter_z * trial_outcome | subjectId),
+         data = .)
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>%
+      mutate(trial_outcome = factor(trial_outcome, 
+                                    levels=c("Match", "Mismatch"))) %>%
+      lmer(power ~ pupil_diameter_z * trial_outcome +
+             (pupil_diameter_z + trial_outcome | subjectId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>%
+      mutate(trial_outcome = factor(trial_outcome, 
+                                    levels=c("Match", "Mismatch"))) %>%
+      lmer(power ~ pupil_diameter_z * trial_outcome +
+             (pupil_diameter_z | subjectId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>%
+      mutate(trial_outcome = factor(trial_outcome, 
+                                    levels=c("Match", "Mismatch"))) %>%
+      lmer(power ~ pupil_diameter_z * trial_outcome +
+             (1 | subjectId),
+           data = .)
+  }
+  
+  title <- formula(mod)[3]
+  
+  tidy(mod, effects = "fixed", conf.int = T, conf.level = 0.95) %>% 
+    select(term, estimate, conf.low, conf.high, p.value, std.error, df) %>% 
+    kable(caption=paste(this.comparison, ": ", title, sep=""),
+          digits=3) %>% 
+    kable_styling() %>% 
+    cat()
+  
+  tidy(mod, effects = "ran_pars", scales = "vcov") %>% 
+    select(term, estimate) %>% 
+    kable(digits=3, caption="Random effects") %>% 
+    kable_styling() %>% 
+    cat()
+  
+}
+
+```
+
+```{r echo=F, fig.width=3, fig.height=2.8, eval=F}
+for (fig in mean.pupil.plts) {
+  (fig + 
+     theme(plot.title=element_blank(),
+           legend.position = "none")) %>% 
+     print()
+}
+```
+
+### Pupil ~ power
+
+```{r strong_pupil_power, echo=F, fig.width=7, results="asis", eval=T}
+
+nbins <- 5
+
+ymin.pupil <- -0.4
+ymax.pupil <- 0.5
+
+if (power_name == "frontal-theta") {
+  ymin.power <- -0.2
+  ymax.power <- 0.6
+} else if (power_name == "posterior-alpha") {
+  ymin.power <- -0.5
+  ymax.power <- 0.5
+}
+
+mean.pupil.plts <- list()
+
+if (power_name == "frontal-theta") {
+  comparisons.of.interest <- c("Mismatch effect x Memory strength \npupil 4 v. power 7")
+} else if (power_name == "posterior-alpha") {
+  comparisons.of.interest <- c("Mismatch effect x Memory strength \npupil 4 v. power 8")
+}
+
+for (this.comparison in comparisons.of.interest) {
+  mod.data <- pupil.power.data %>% 
+    dplyr::filter(comparison == this.comparison) %>% 
+    dplyr::filter(!is.na(power)) %>% 
+    dplyr::filter(!is.na(pupil_diameter_z)) %>% 
+    mutate(trial_outcome = as.character(trial_outcome)) %>% 
+    dplyr::filter(association_strength == "Strong (4x)") %>% 
+    dplyr::filter(trial_outcome %in% c("Hit", "CR")) %>% 
+    mutate(trial_outcome = recode(trial_outcome, 
+                                  "Hit" = "Match",
+                                  "CR" = "Mismatch"))
+  
+  binned.plt <- mod.data %>% 
+    group_by(subjectId, trial_outcome, association_strength) %>%
+    mutate(trial_count = n()) %>%
+    ungroup() %>%
+    dplyr::filter(trial_count > nbins-1) %>%
+    group_by(subjectId, trial_outcome, association_strength) %>%
+    mutate(power_bin = cut_interval(power, 
+                                    n = nbins,
+                                    labels = F)) %>% 
+    ungroup() %>% 
+    group_by(subjectId, trial_outcome, association_strength, power_bin) %>% 
+    summarize(pupil = mean(pupil_diameter_z)) %>% 
+    summarySEwithin(., 
+                    measurevar="pupil", 
+                    withinvars=c("association_strength",
+                                 "trial_outcome",
+                                 "power_bin"), 
+                    idvar="subjectId") %>% 
+    ggplot(aes(x = as.numeric(as.character(power_bin)),
+               y = pupil,
+               color = trial_outcome,
+               fill = trial_outcome)) +
+    geom_line(linewidth=0.8) +
+    geom_point(size=1.5) +
+    geom_errorbar(aes(ymin=pupil-se, ymax=pupil+se),
+                  width=0.2) +
+    scale_color_manual(values=c("#1a75ff", "#ff751a"), name="") + 
+    scale_fill_manual(values=c("#1a75ff", "#ff751a"), name="") + 
+    facet_grid(cols=vars(association_strength)) +
+    labs(y = "Pupil diameter (z)", x = paste(y_axis_power_label, "quintile"),
+         title=this.comparison)
+  
+  mean.pupil.plts[[this.comparison]] <- binned.plt
+  
+  this.term <- (mod.data %>% select(term) %>% unique())$term
+  if (this.term == "Mismatch v. Match") {
+    this.color <- "#9E0059"
+  } else if (this.term == "Memory strength (Weak v. Strong)") {
+    this.color <- "#1A936F"
+  } else {
+    this.color <- "#FFD131"
+  }
+  
+  
+  if (this.comparison == "Mismatch effect x Memory strength \npupil 4 v. power 7") {
+    pupil.cluster <- 4
+    power.cluster <- 7
+    this.term <- "Mismatch effect x Memory strength"
+    title <- "Mismatch x Strength"
+  }
+  if (this.comparison == "Mismatch effect x Memory strength \npupil 4 v. power 8") {
+    pupil.cluster <- 4
+    power.cluster <- 8
+    this.term <- "Mismatch effect x Memory strength"
+    title <- "Mismatch x Strength"
+  }
+  
+  beta.plt <- betas.df %>% 
+    dplyr::filter(term == this.term) %>% 
+    ggplot(aes(x=as.numeric(as.character(time)), 
+               y=estimate,
+               color=term,
+               fill=term)) + 
+    geom_ribbon(aes(ymin=estimate-se, ymax=estimate+se),
+                color=NA,
+                fill=this.color,
+                alpha=0.3) +
+    geom_line(linewidth = 0.6, color=this.color) +
+    geom_vline(xintercept = c(0, 1, 2, 2.75),
+               linetype = "dashed",
+               color = "gray37") +
+    geom_hline(yintercept = c(0),
+               linetype = "longdash",
+               color = "gray37") +
+    # mark significant difference
+    geom_point(aes(x = time,
+                   y = ypos),
+               color=this.color,
+               show.legend = F,
+               data = results.betas %>% 
+                 dplyr::filter(cluster_id == power.cluster),
+               size = 1) +
+    labs(x = "Time (s)",
+         y = paste("Power", greek.beta),
+         title = title) +
+    guides(color="none",
+           fill="none") + 
+    facet_wrap(~term, ncol=1, scales="free_y", strip.position="top") +
+    theme(strip.text.x = element_blank(),
+          axis.line.y=element_blank(),
+          axis.text.x=element_text(size=8.5),
+          axis.text.y=element_blank(),
+          axis.ticks.y=element_blank(),
+          axis.title = element_text(size=8.5),
+          strip.background=element_rect(colour=NA),
+          plot.title = element_text(size=8.5, hjust = 0.5))
+  
+  pupil.beta.plt <- pupil.betas %>% 
+    group_by(time, term) %>% 
+    summarize(se = sd(estimate) / sqrt(sum(!is.na(estimate))),
+              estimate = mean(estimate)) %>% 
+    ungroup() %>% 
+    mutate(term = case_when(term == "association_strengthWeak (1x)" ~ "Memory strength (Weak v. Strong)",
+                            term == "association_strengthWeak (1x):is_mismatch" ~ "Mismatch effect x Memory strength",
+                            term == "is_mismatch" ~ "Mismatch v. Match",
+                            term == "(Intercept)" ~ "Intercept",
+                            .default="")) %>% 
+    dplyr::filter(term == this.term) %>% 
+    ggplot(aes(x=as.numeric(as.character(time)), 
+               y=estimate,
+               color=term,
+               fill=term)) + 
+    geom_ribbon(aes(ymin=estimate-se, ymax=estimate+se),
+                color=NA,
+                alpha=0.3) +
+    geom_line(linewidth = 0.6, color=this.color) +
+    geom_vline(xintercept = c(0, 1, 2, 2.75),
+               linetype = "dashed",
+               color = "gray37") +
+    geom_hline(yintercept = c(0),
+               linetype = "longdash",
+               color = "gray37") +
+    # mark significant difference
+    geom_point(aes(x = time,
+                   y = ypos),
+               color = this.color,
+               show.legend = F,
+               data = pupil.results.betas %>% 
+                 dplyr::filter(cluster_id == pupil.cluster),
+               size = 1) +
+    labs(x = "Time (s)",
+         y = paste("Pupil", greek.beta),
+         title = title) +
+    guides(color="none",
+           fill="none") + 
+    facet_wrap(~term, ncol=1, scales="free_y", strip.position="top") +
+    scale_color_manual(values=c(this.color), name="") + 
+    scale_fill_manual(values=c(this.color), name="") + 
+    theme(strip.text.x = element_blank(),
+          axis.line.y=element_blank(),
+          axis.text.x=element_text(size=8.5),
+          axis.text.y=element_blank(),
+          axis.ticks.y=element_blank(),
+          axis.title = element_text(size=8.5),
+          strip.background=element_rect(colour=NA),
+          plot.title = element_text(size=8.5, hjust = 0.5))
+  
+  design <- "
+        ###222222222
+        ###222222222
+        111222222222
+        111222222222
+        ###222222222
+        ######333###
+        ######333###
+        "
+  
+  (pupil.beta.plt
+   + 
+     binned.plt + # theme(plot.title = element_blank()) +
+     beta.plt + 
+     plot_layout(design=design)) %>% 
+    print()
+  
+  mod <- mod.data %>%
+    mutate(trial_outcome = factor(trial_outcome, 
+                                  levels=c("Match", "Mismatch"))) %>%
+    lmer(pupil_diameter_z ~ power * trial_outcome +
+           (power * trial_outcome | subjectId),
+         data = .)
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>%
+      mutate(trial_outcome = factor(trial_outcome, 
+                                    levels=c("Match", "Mismatch"))) %>%
+      lmer(pupil_diameter_z ~ power * trial_outcome +
+             (power + trial_outcome | subjectId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>%
+      mutate(trial_outcome = factor(trial_outcome, 
+                                    levels=c("Match", "Mismatch"))) %>%
+      lmer(pupil_diameter_z ~ power * trial_outcome +
+             (1 | subjectId),
+           data = .)
+  }
+  
+  title <- formula(mod)[3]
+  
+  tidy(mod, effects = "fixed", conf.int = T, conf.level = 0.95) %>% 
+    select(term, estimate, conf.low, conf.high, p.value, std.error, df) %>% 
+    kable(caption=paste(this.comparison, ": ", title, sep=""),
+          digits=3) %>% 
+    kable_styling() %>% 
+    cat()
+  
+  tidy(mod, effects = "ran_pars", scales = "vcov") %>% 
+    select(term, estimate) %>% 
+    kable(digits=3, caption="Random effects") %>% 
+    kable_styling() %>% 
+    cat()
+  
+}
+
+```
+
+```{r echo=F, fig.width=3, fig.height=2.8, eval=F}
+for (fig in mean.pupil.plts) {
+  (fig + 
+     theme(plot.title=element_blank(),
+           legend.position = "none")) %>% 
+     print()
+}
+```
+
+### Retrieval-MPE interactions (pupil ~ power)
+
+```{r strong_pupil_power_ret_mpe, echo=F, fig.width=7, results="asis", eval=T}
+
+nbins <- 5
+
+ymin.pupil <- -0.4
+ymax.pupil <- 0.5
+
+if (power_name == "frontal-theta") {
+  ymin.power <- -0.2
+  ymax.power <- 0.6
+} else if (power_name == "posterior-alpha") {
+  ymin.power <- -0.5
+  ymax.power <- 0.5
+}
+
+mean.pupil.plts <- list()
+
+for (this.comparison in interaction.MPE.data %>% pull(comparison) %>% unique()) {
+  mod.data <- interaction.MPE.data %>% 
+    dplyr::filter(comparison == this.comparison) %>% 
+    dplyr::filter(!is.na(power)) %>% 
+    dplyr::filter(!is.na(pupil_diameter_z)) %>% 
+    mutate(trial_outcome = as.character(trial_outcome)) %>% 
+    dplyr::filter(association_strength == "Strong (4x)") %>% 
+    dplyr::filter(trial_outcome %in% c("Hit", "CR")) %>% 
+    mutate(trial_outcome = recode(trial_outcome, 
+                                  "Hit" = "Match",
+                                  "CR" = "Mismatch"))
+  
+  binned.plt <- mod.data %>% 
+    group_by(subjectId, trial_outcome, association_strength) %>%
+    mutate(trial_count = n()) %>%
+    ungroup() %>%
+    dplyr::filter(trial_count > nbins-1) %>%
+    group_by(subjectId, trial_outcome, association_strength) %>%
+    mutate(power_bin = cut_interval(power, 
+                                    n = nbins,
+                                    labels = F)) %>% 
+    ungroup() %>% 
+    group_by(subjectId, trial_outcome, association_strength, power_bin) %>% 
+    summarize(pupil = mean(pupil_diameter_z)) %>% 
+    summarySEwithin(., 
+                    measurevar="pupil", 
+                    withinvars=c("association_strength",
+                                 "trial_outcome",
+                                 "power_bin"), 
+                    idvar="subjectId") %>% 
+    ggplot(aes(x = as.numeric(as.character(power_bin)),
+               y = pupil,
+               color = trial_outcome,
+               fill = trial_outcome)) +
+    geom_line(linewidth=0.8) +
+    geom_point(size=1.5) +
+    geom_errorbar(aes(ymin=pupil-se, ymax=pupil+se),
+                  width=0.2) +
+    scale_color_manual(values=c("#1a75ff", "#ff751a"), name="") + 
+    scale_fill_manual(values=c("#1a75ff", "#ff751a"), name="") + 
+    facet_grid(cols=vars(association_strength)) +
+    labs(y = "Pupil diameter (z)", x = paste(y_axis_power_label, "quintile"),
+         title=this.comparison)
+  
+  mean.pupil.plts[[this.comparison]] <- binned.plt
+  
+  design <- "
+    ##2222
+    112222
+    112222
+    112222
+    ##2222
+    ###33#
+    ###33#
+    ###33#
+  "
+  
+  this.term.pupil <- (mod.data %>% pull(term.pupil) %>% unique())[1]
+  if (this.term.pupil == "Mismatch v. Match") {
+    this.color.pupil <- "#9E0059"
+  } else if (this.term.pupil == "Memory strength (Weak v. Strong)") {
+    this.color.pupil <- "#1A936F"
+  } else {
+    this.color.pupil <- "#FFD131"
+  }
+  
+  this.term.power <- (mod.data %>% pull(term.power) %>% unique())[1]
+  if (this.term.power == "Mismatch v. Match") {
+    this.color.power <- "#9E0059"
+  } else if (this.term.power == "Memory strength (Weak v. Strong)") {
+    this.color.power <- "#1A936F"
+  } else {
+    this.color.power <- "#FFD131"
+  }
+  
+  
+  power.lims <- mod.data %>% select(!!sym(start.name), !!sym(end.name)) %>% unique()
+  pupil.lims <- mod.data %>% select(start.pupil, end.pupil) %>% unique()
+  
+  power.cluster_id <- mod.data %>% pull(!!sym(cluster_id.power)) %>% unique()
+  pupil.cluster_id <- mod.data %>% pull(cluster_id.pupil) %>% unique()
+  
+  if (this.term.power == "Mismatch v. Match") {
+    power.title <- "Mismatch"
+  } else if (this.term.power == "Memory strength (Weak v. Strong)") {
+    power.title <- "Strength"
+  } else if (this.term.power == "Mismatch effect x Memory strength") {
+    power.title <- "Mismatch x Strength"
+  }
+  
+  if (this.term.pupil == "Mismatch v. Match") {
+    pupil.title <- "Mismatch"
+  } else if (this.term.power == "Memory strength (Weak v. Strong)") {
+    pupil.title <- "Strength"
+  } else if (this.term.power == "Mismatch effect x Memory strength") {
+    pupil.title <- "Mismatch x Strength"
+  }
+  
+  beta.plt <- betas.df %>% 
+    dplyr::filter(as.character(term) == as.character(this.term.power)) %>% 
+    ggplot(aes(x=as.numeric(as.character(time)), 
+               y=estimate,
+               color=term,
+               fill=term)) + 
+    geom_ribbon(aes(ymin=estimate-se, ymax=estimate+se),
+                color=NA,
+                fill=this.color.power,
+                alpha=0.3) +
+    geom_line(linewidth = 0.6, color=this.color.power) +
+    geom_vline(xintercept = c(0, 1, 2, 2.75),
+               linetype = "dashed",
+               color = "gray37") +
+    geom_hline(yintercept = c(0),
+               linetype = "longdash",
+               color = "gray37") +
+    # mark significant difference
+    geom_point(aes(x = time,
+                   y = ypos),
+               color=this.color.power,
+               show.legend = F,
+               data = results.betas %>% 
+                 dplyr::filter(cluster_id == power.cluster_id),
+               size = 1) +
+    labs(x = "Time (s)",
+         y = paste("Power", greek.beta),
+         title = power.title) +
+    guides(color="none",
+           fill="none") + 
+    facet_wrap(~term, ncol=1, scales="free_y", strip.position="top") +
+    theme(strip.text.x = element_blank(),
+          axis.line.y=element_blank(),
+          axis.text.x=element_text(size=8.5),
+          axis.text.y=element_blank(),
+          axis.ticks.y=element_blank(),
+          axis.title = element_text(size=8.5),
+          strip.background=element_rect(colour=NA),
+          plot.title = element_text(size=8.5, hjust = 0.5))
+  
+  pupil.beta.plt <- pupil.betas %>% 
+    group_by(time, term) %>% 
+    summarize(se = sd(estimate) / sqrt(sum(!is.na(estimate))),
+              estimate = mean(estimate)) %>% 
+    ungroup() %>% 
+    mutate(term = case_when(term == "association_strengthWeak (1x)" ~ "Memory strength (Weak v. Strong)",
+                            term == "association_strengthWeak (1x):is_mismatch" ~ "Mismatch effect x Memory strength",
+                            term == "is_mismatch" ~ "Mismatch v. Match",
+                            term == "(Intercept)" ~ "Intercept",
+                            .default="")) %>% 
+    dplyr::filter(as.character(term) == as.character(this.term.pupil)) %>% 
+    ggplot(aes(x=as.numeric(as.character(time)), 
+               y=estimate,
+               color=term,
+               fill=term)) + 
+    geom_ribbon(aes(ymin=estimate-se, ymax=estimate+se),
+                color=NA,
+                alpha=0.3) +
+    geom_line(linewidth = 0.6, color=this.color.pupil) +
+    geom_vline(xintercept = c(0, 1, 2, 2.75),
+               linetype = "dashed",
+               color = "gray37") +
+    geom_hline(yintercept = c(0),
+               linetype = "longdash",
+               color = "gray37") +
+    # mark significant difference
+    geom_point(aes(x = time,
+                   y = ypos),
+               color = this.color.pupil,
+               show.legend = F,
+               data = pupil.results.betas %>% 
+                 dplyr::filter(cluster_id == pupil.cluster_id),
+               size = 1) +
+    labs(x = "Time (s)",
+         y = paste("Pupil", greek.beta),
+         title = pupil.title) +
+    guides(color="none",
+           fill="none") + 
+    facet_wrap(~term, ncol=1, scales="free_y", strip.position="top") +
+    scale_color_manual(values=c(this.color.pupil), name="") + 
+    scale_fill_manual(values=c(this.color.pupil), name="") + 
+    theme(strip.text.x = element_blank(),
+          axis.line.y=element_blank(),
+          axis.text.x=element_text(size=8.5),
+          axis.text.y=element_blank(),
+          axis.ticks.y=element_blank(),
+          axis.title = element_text(size=8.5),
+          strip.background=element_rect(colour=NA),
+          plot.title = element_text(size=8.5, hjust = 0.5))
+  
+  design <- "
+        ###222222222
+        ###222222222
+        111222222222
+        111222222222
+        ###222222222
+        ######333###
+        ######333###
+        "
+  
+  (pupil.beta.plt
+   + 
+     binned.plt + # theme(plot.title = element_blank()) +
+     beta.plt + 
+     plot_layout(design=design)) %>% 
+    print()
+  
+  mod <- mod.data %>%
+    mutate(trial_outcome = factor(trial_outcome, 
+                                  levels=c("Match", "Mismatch"))) %>%
+    lmer(pupil_diameter_z ~ power * trial_outcome +
+           (power * trial_outcome | subjectId),
+         data = .)
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>%
+      mutate(trial_outcome = factor(trial_outcome, 
+                                    levels=c("Match", "Mismatch"))) %>%
+      lmer(pupil_diameter_z ~ power * trial_outcome +
+             (power + trial_outcome | subjectId),
+           data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>%
+      mutate(trial_outcome = factor(trial_outcome, 
+                                    levels=c("Match", "Mismatch"))) %>%
+      lmer(pupil_diameter_z ~ power * trial_outcome +
+             (1 | subjectId),
+           data = .)
+  }
+  
+  title <- formula(mod)[3]
+  
+  tidy(mod, effects = "fixed", conf.int = T, conf.level = 0.95) %>% 
+    select(term, estimate, conf.low, conf.high, p.value, std.error, df) %>% 
+    kable(caption=paste(this.comparison, ": ", title, sep=""),
+          digits=3) %>% 
+    kable_styling() %>% 
+    cat()
+  
+  tidy(mod, effects = "ran_pars", scales = "vcov") %>% 
+    select(term, estimate) %>% 
+    kable(digits=3, caption="Random effects") %>% 
+    kable_styling() %>% 
+    cat()
+}
+```
+
+```{r echo=F, fig.width=3, fig.height=2.8, eval=F}
+for (fig in mean.pupil.plts) {
+  (fig + 
+     theme(plot.title=element_blank(),
+           legend.position = "none")) %>% 
+     print()
+}
+```
+
+## Power ~ pupil PC
+
+```{r strong_power_pc, eval=T, echo=F, fig.width=7, fig.height=4, results="asis"}
+
+power.plus.pupil <- power.clusters %>%
+  group_by(subjectId, term, trialN, association_strength, trial_outcome,
+           !!sym(cluster_id.power), !!sym(start.name), !!sym(end.name),
+           power) %>% 
+  summarize() %>% 
+  ungroup() %>% 
+  right_join(pupil.pca.scores, 
+             suffix = c(".power", ".pupil_pc"),
+             multiple="all") %>%
+  dplyr::filter(association_strength == "Strong (4x)") %>% 
+  dplyr::filter(trial_outcome %in% c("Hit", "CR")) %>% 
+  mutate(trial_outcome = recode(trial_outcome, 
+                                "Hit" = "Match",
+                                "CR" = "Mismatch")) %>% 
+  dplyr::filter(!is.na(power))
+
+if (power_name == "frontal-theta") {
+  clusters.of.interest <- c(3, 7)
+} else if (power_name == "posterior-alpha") {
+  clusters.of.interest <- c(3, 4, 8)
+}
+
+all.binned.plts <- list()
+
+for (this.cluster in clusters.of.interest) {
+  all.pc.plts <- list()
+  all.pc.loading.plts <- list()
+  
+  for (pc in c("PC1", "PC3", "PC4", "PC5")) {
+    loading.plt <- get_pc_loading_plt(pc)
+    
+    mod.data <- power.plus.pupil %>%
+      dplyr::filter(!!sym(cluster_id.power) == this.cluster) %>% 
+      dplyr::filter(component == pc) %>% 
+      mutate(trial_outcome = as.character(trial_outcome))
+    
+    lm.plt <- mod.data %>%
+      group_by(subjectId, !!sym(cluster_id.power), component, association_strength, trial_outcome) %>%
+      mutate(trial_count = n()) %>%
+      ungroup() %>%
+      dplyr::filter(trial_count > nbins - 1) %>%
+      group_by(subjectId, !!sym(cluster_id.power), component, association_strength, trial_outcome) %>%
+      mutate(component_score_bin = cut_interval(component_score,
+                                                n = nbins,
+                                                labels = F)) %>%
+      ungroup() %>%
+      group_by(subjectId, !!sym(cluster_id.power), component_score_bin, trial_outcome, association_strength,
+               component) %>%
+      summarize(power = mean(power)) %>%
+      ungroup() %>%
+      mutate(trial_outcome = as.character(trial_outcome)) %>% 
+      mutate(trial_outcome=replace(trial_outcome, trial_outcome=="Hit", "Match")) %>%
+      mutate(trial_outcome=replace(trial_outcome, trial_outcome=="CR", "Mismatch")) %>%
+      dplyr::filter(trial_outcome %in% c("Match", "Mismatch")) %>%
+      summarySEwithin(.,
+                      measurevar="power",
+                      withinvars=c("association_strength",
+                                   "trial_outcome",
+                                   "component",
+                                   "component_score_bin"),
+                      idvar="subjectId") %>%
+      ggplot(aes(x = as.numeric(as.character(component_score_bin)),
+                 y = power,
+                 color = trial_outcome,
+                 fill = trial_outcome)) +
+      geom_line(linewidth=0.8) +
+      geom_point(size=1.5) +
+      geom_errorbar(aes(ymin=power-se, ymax=power+se),
+                    width=0.2) +
+      facet_grid(cols = vars(association_strength),
+                 scales = "free") +
+      scale_color_manual(values=c("#1a75ff", "#ff751a"), name="") + 
+      scale_fill_manual(values=c("#1a75ff", "#ff751a"), name="") + 
+      labs(x = paste(pc, "score quintile"), y = paste(y_axis_power_label, "(z)"),
+           title = paste("Power cluster:", this.cluster, sep=" "))
+    
+    this.term <- (mod.data %>% select(term) %>% unique())$term
+    if (this.term == "Mismatch v. Match") {
+      this.color <- "#9E0059"
+    } else if (this.term == "Memory strength (Weak v. Strong)") {
+      this.color <- "#1A936F"
+    } else {
+      this.color <- "#FFD131"
+    }
+    
+    design <- "
+    ######
+    ##2222
+    112222
+    112222
+    112222
+    ##2222
+    ###33#
+    ###33#
+    ###33#
+    "
+    
+    beta.plt <- betas.df %>% 
+      dplyr::filter(term == as.character(this.term)) %>% 
+      ggplot(aes(x=as.numeric(as.character(time)), 
+                 y=estimate,
+                 color=term,
+                 fill=term)) + 
+      geom_ribbon(aes(ymin=estimate-se, ymax=estimate+se),
+                  color=NA,
+                  alpha=0.3) +
+      geom_line(linewidth = 0.6, color=this.color) +
+      geom_vline(xintercept = c(0, 1, 2, 2.75),
+                 linetype = "dashed",
+                 color = "gray37") +
+      geom_hline(yintercept = c(0),
+                 linetype = "longdash",
+                 color = "gray37") +
+      # mark significant difference
+      geom_point(aes(x = time,
+                     y = ypos),
+                 color = this.color,
+                 show.legend = F,
+                 data = results.betas %>% 
+                   dplyr::filter(cluster_id == this.cluster),
+                 size = 1) +
+      labs(x = "Time (s)",
+           y = paste("Power", greek.beta),
+           title = "Strength") +
+      guides(color="none",
+             fill="none") + 
+      facet_wrap(~term, ncol=1, scales="free_y", strip.position="top") +
+      scale_color_manual(values=this.color, name="") + 
+      scale_fill_manual(values=this.color, name="") + 
+      theme(strip.text.x = element_blank(),
+            axis.line.y=element_blank(),
+            axis.text.x=element_text(size=8.5),
+            axis.text.y=element_blank(),
+            axis.ticks.y=element_blank(),
+            axis.title = element_text(size=8.5),
+            strip.background=element_rect(colour=NA),
+            plot.title = element_text(size=8.5, hjust = 0.5))
+    
+    all.binned.plts[[length(all.binned.plts)+1]] <- lm.plt
+    all.pc.plts[[pc]] <- lm.plt 
+    all.pc.loading.plts[[pc]] <- loading.plt
+    
+    (beta.plt + 
+        all.pc.plts[[pc]] + theme(plot.title = element_blank()) +
+        all.pc.loading.plts[[pc]] + 
+        plot_layout(design=design, guides="collect", axes="collect") & 
+        theme()) %>% 
+      print()
+    
+    title <- paste("Cluster: ", this.cluster, "; ", pc, sep="")
+    
+    mod <- mod.data %>%
+      mutate(trial_outcome = factor(trial_outcome, 
+                                    levels=c("Match", "Mismatch"))) %>%
+      lmer(power ~ component_score * trial_outcome +
+             (component_score * trial_outcome | subjectId),
+           data = .)
+    
+    if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+      mod <- mod.data %>%
+        mutate(trial_outcome = factor(trial_outcome, 
+                                      levels=c("Match", "Mismatch"))) %>%
+        lmer(power ~ component_score * trial_outcome +
+               (component_score + trial_outcome | subjectId),
+             data = .)
+    }
+    
+    if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+      mod <- mod.data %>%
+        mutate(trial_outcome = factor(trial_outcome, 
+                                      levels=c("Match", "Mismatch"))) %>%
+        lmer(power ~ component_score * trial_outcome + 
+               (1 | subjectId),
+             data = .)
+    }
+    
+    title <- formula(mod)[3]
+    
+    tidy(mod, effects = "fixed", conf.int = T, conf.level = 0.95) %>% 
+      select(term, estimate, conf.low, conf.high, p.value, std.error, df) %>% 
+      kable(caption=paste(pc, ": ", title, sep=""),
+            digits=3) %>% 
+      kable_styling() %>%
+      cat()
+    
+    tidy(mod, effects = "ran_pars", scales = "vcov") %>% 
+      select(term, estimate) %>% 
+      kable(digits=3, caption="Random effects") %>% 
+      kable_styling() %>% 
+      cat()
+    
+  }
+  
+  # cognitive effort and memory reinstatement
+  if ((power_name == "frontal-theta" & this.cluster == 3) |
+      (power_name == "posterior-alpha" & this.cluster == 3) | 
+      (power_name == "posterior-alpha" & this.cluster == 4)) {
+    
+    design <- "
+      ##22224444
+      1122224444
+      1122224444
+      ##22224444
+      ###33##55#
+      ###33##55#
+    "
+    
+    beta.plt <- betas.df %>% 
+      dplyr::filter(term == "Memory strength (Weak v. Strong)") %>% 
+      ggplot(aes(x=as.numeric(as.character(time)), 
+                 y=estimate,
+                 color=term,
+                 fill=term)) + 
+      geom_ribbon(aes(ymin=estimate-se, ymax=estimate+se),
+                  color=NA,
+                  alpha=0.3) +
+      geom_line(linewidth = 0.6, color=this.color) +
+      geom_vline(xintercept = c(0, 1, 2, 2.75),
+                 linetype = "dashed",
+                 color = "gray37") +
+      geom_hline(yintercept = c(0),
+                 linetype = "longdash",
+                 color = "gray37") +
+      # mark significant difference
+      geom_point(aes(x = time,
+                     y = ypos),
+                 color = this.color,
+                 show.legend = F,
+                 data = results.betas %>% 
+                   dplyr::filter(cluster_id == this.cluster),
+                 size = 1) +
+      labs(x = "Time (s)",
+           y = paste("Power", greek.beta),
+           title = "Strength") +
+      guides(color="none",
+             fill="none") + 
+      facet_wrap(~term, ncol=1, scales="free_y", strip.position="top") +
+      scale_color_manual(values=beta_palette[3], name="") + 
+      scale_fill_manual(values=beta_palette[3], name="") + 
+      theme(strip.text.x = element_blank(),
+            axis.line.y=element_blank(),
+            axis.text.x=element_text(size=8.5),
+            axis.text.y=element_blank(),
+            axis.ticks.y=element_blank(),
+            axis.title = element_text(size=8.5),
+            strip.background=element_rect(colour=NA),
+            plot.title = element_text(size=8.5, hjust = 0.5))
+    
+    
+    (beta.plt + 
+        all.pc.plts[["PC1"]] + theme(plot.title = element_blank()) +
+        all.pc.loading.plts[["PC1"]] + 
+        all.pc.plts[["PC5"]] + theme(plot.title = element_blank()) +
+        all.pc.loading.plts[["PC5"]] + 
+        guides(color=guide_legend(nrow=1)) + 
+        plot_layout(design=design, guides="collect", axes="collect") & 
+        theme(legend.position = "top")) %>% 
+      print()
+    
+    
+    beta.plt <- betas.df %>% 
+      dplyr::filter(term == "Memory strength (Weak v. Strong)") %>% 
+      ggplot(aes(x=as.numeric(as.character(time)), 
+                 y=estimate,
+                 color=term,
+                 fill=term)) + 
+      geom_ribbon(aes(ymin=estimate-se, ymax=estimate+se),
+                  color=NA,
+                  alpha=0.3) +
+      geom_line(linewidth = 0.6, color=this.color) +
+      geom_vline(xintercept = c(0, 1, 2, 2.75),
+                 linetype = "dashed",
+                 color = "gray37") +
+      geom_hline(yintercept = c(0),
+                 linetype = "longdash",
+                 color = "gray37") +
+      # mark significant difference
+      geom_point(aes(x = time,
+                     y = ypos),
+                 color = this.color,
+                 show.legend = F,
+                 data = results.betas %>% 
+                   dplyr::filter(cluster_id == this.cluster),
+                 size = 1) +
+      labs(x = "Time (s)",
+           y = paste("Power", greek.beta),
+           title = "Strength") +
+      guides(color="none",
+             fill="none") + 
+      facet_wrap(~term, ncol=1, scales="free_y", strip.position="top") +
+      scale_color_manual(values=beta_palette[3], name="") + 
+      scale_fill_manual(values=beta_palette[3], name="") + 
+      theme(strip.text.x = element_blank(),
+            axis.line.y=element_blank(),
+            axis.text.x=element_text(size=8.5),
+            axis.text.y=element_blank(),
+            axis.ticks.y=element_blank(),
+            axis.title = element_text(size=8.5),
+            strip.background=element_rect(colour=NA),
+            plot.title = element_text(size=8.5, hjust = 0.5))
+    
+    
+    (beta.plt + 
+        all.pc.plts[["PC3"]] + theme(plot.title = element_blank()) +
+        all.pc.loading.plts[["PC3"]] + 
+        all.pc.plts[["PC4"]] + theme(plot.title = element_blank()) +
+        all.pc.loading.plts[["PC4"]] + 
+        guides(color=guide_legend(nrow=1)) + 
+        plot_layout(design=design, guides="collect", axes="collect") & 
+        theme(legend.position = "top")) %>% 
+      print()
+  }
+  
+  # mnemonic prediction error 
+  if ((power_name == "frontal-theta" & this.cluster == 7) | 
+      (power_name == "posterior-alpha" & this.cluster == 8)) {
+    design <- "
+      ##22224444
+      1122224444
+      1122224444
+      ##22224444
+      ###33##55#
+      ###33##55#
+    "
+    
+    beta.plt <- betas.df %>% 
+      dplyr::filter(term == "Mismatch effect x Memory strength") %>% 
+      ggplot(aes(x=as.numeric(as.character(time)), 
+                 y=estimate,
+                 color=term,
+                 fill=term)) + 
+      geom_ribbon(aes(ymin=estimate-se, ymax=estimate+se),
+                  color=NA,
+                  alpha=0.3) +
+      geom_line(linewidth = 0.6, color=this.color) +
+      geom_vline(xintercept = c(0, 1, 2, 2.75),
+                 linetype = "dashed",
+                 color = "gray37") +
+      geom_hline(yintercept = c(0),
+                 linetype = "longdash",
+                 color = "gray37") +
+      # mark significant difference
+      geom_point(aes(x = time,
+                     y = ypos),
+                 color = this.color,
+                 show.legend = F,
+                 data = results.betas %>% 
+                   dplyr::filter(cluster_id == this.cluster),
+                 size = 1) +
+      labs(x = "Time (s)",
+           y = paste("Power", greek.beta),
+           title = "Mismatch x Strength") +
+      guides(color="none",
+             fill="none") + 
+      facet_wrap(~term, ncol=1, scales="free_y", strip.position="top") +
+      scale_color_manual(values=beta_palette[4], name="") + 
+      scale_fill_manual(values=beta_palette[4], name="") + 
+      theme(strip.text.x = element_blank(),
+            axis.line.y=element_blank(),
+            axis.text.x=element_text(size=8.5),
+            axis.text.y=element_blank(),
+            axis.ticks.y=element_blank(),
+            axis.title = element_text(size=8.5),
+            strip.background=element_rect(colour=NA),
+            plot.title = element_text(size=8.5, hjust = 0.5))
+    
+    
+    (beta.plt + 
+        all.pc.plts[["PC3"]] + theme(plot.title = element_blank()) +
+        all.pc.loading.plts[["PC3"]] + 
+        all.pc.plts[["PC4"]] + theme(plot.title = element_blank()) +
+        all.pc.loading.plts[["PC4"]] + 
+        guides(color=guide_legend(nrow=1)) + 
+        plot_layout(design=design, guides="collect", axes="collect") & 
+        theme(legend.position = "top")) %>% 
+      print()
+    
+    beta.plt <- betas.df %>% 
+      dplyr::filter(term == "Mismatch effect x Memory strength") %>% 
+      ggplot(aes(x=as.numeric(as.character(time)), 
+                 y=estimate,
+                 color=term,
+                 fill=term)) + 
+      geom_ribbon(aes(ymin=estimate-se, ymax=estimate+se),
+                  color=NA,
+                  alpha=0.3) +
+      geom_line(linewidth = 0.6, color=this.color) +
+      geom_vline(xintercept = c(0, 1, 2, 2.75),
+                 linetype = "dashed",
+                 color = "gray37") +
+      geom_hline(yintercept = c(0),
+                 linetype = "longdash",
+                 color = "gray37") +
+      # mark significant difference
+      geom_point(aes(x = time,
+                     y = ypos),
+                 color = this.color,
+                 show.legend = F,
+                 data = results.betas %>% 
+                   dplyr::filter(cluster_id == this.cluster),
+                 size = 1) +
+      labs(x = "Time (s)",
+           y = paste("Power", greek.beta),
+           title = "Mismatch x Strength") +
+      guides(color="none",
+             fill="none") + 
+      facet_wrap(~term, ncol=1, scales="free_y", strip.position="top") +
+      scale_color_manual(values=beta_palette[4], name="") + 
+      scale_fill_manual(values=beta_palette[4], name="") + 
+      theme(strip.text.x = element_blank(),
+            axis.line.y=element_blank(),
+            axis.text.x=element_text(size=8.5),
+            axis.text.y=element_blank(),
+            axis.ticks.y=element_blank(),
+            axis.title = element_text(size=8.5),
+            strip.background=element_rect(colour=NA),
+            plot.title = element_text(size=8.5, hjust = 0.5))
+    
+    
+    (beta.plt + 
+        all.pc.plts[["PC1"]] + theme(plot.title = element_blank()) +
+        all.pc.loading.plts[["PC1"]] + 
+        all.pc.plts[["PC5"]] + theme(plot.title = element_blank()) +
+        all.pc.loading.plts[["PC5"]] + 
+        guides(color=guide_legend(nrow=1)) + 
+        plot_layout(design=design, guides="collect", axes="collect") & 
+        theme(legend.position = "top")) %>% 
+      print()
+  }
+  
+}
+
+```
+
+```{r echo=F, fig.width=3, fig.height=2.8, eval=F}
+for (fig in all.binned.plts) {
+  (fig + 
+     theme(plot.title=element_blank(),
+           legend.position = "none")) %>% 
+     print()
+}
+```
+
+### PC ~ power
+
+```{r strong_pc_power, eval=T, echo=F, fig.width=8, fig.height=4.5, results="asis"}
+
+all.binned.plts <- list()
+
+if (power_name == "frontal-theta") {
+  clusters.of.interest <- c(3, 7)
+} else if (power_name == "posterior-alpha") {
+  clusters.of.interest <- c(3, 4, 8)
+}
+
+for (this.cluster in clusters.of.interest) {
+  all.pc.plts <- list()
+  for (pc in c("PC1", "PC3", "PC4", "PC5")) {
+    loading.plt <- get_pc_loading_plt(pc)
+    
+    mod.data <- power.plus.pupil %>%
+      dplyr::filter(!!sym(cluster_id.power) == this.cluster) %>% 
+      dplyr::filter(component == pc) %>% 
+      mutate(trial_outcome = as.character(trial_outcome))
+    
+    lm.plt <- mod.data %>%
+      group_by(subjectId, !!sym(cluster_id.power), component, association_strength, trial_outcome) %>%
+      mutate(trial_count = n()) %>%
+      ungroup() %>%
+      dplyr::filter(trial_count > nbins - 1) %>%
+      group_by(subjectId, !!sym(cluster_id.power), component, association_strength, trial_outcome) %>%
+      mutate(power_bin = cut_interval(power,
+                                      n = nbins,
+                                      labels = F)) %>%
+      ungroup() %>%
+      group_by(subjectId, !!sym(cluster_id.power), power_bin, trial_outcome, association_strength,
+               component) %>%
+      summarize(component_score = mean(component_score)) %>%
+      ungroup() %>%
+      mutate(trial_outcome = as.character(trial_outcome)) %>% 
+      mutate(trial_outcome=replace(trial_outcome, trial_outcome=="Hit", "Match")) %>%
+      mutate(trial_outcome=replace(trial_outcome, trial_outcome=="CR", "Mismatch")) %>%
+      dplyr::filter(trial_outcome %in% c("Match", "Mismatch")) %>%
+      summarySEwithin(.,
+                      measurevar="component_score",
+                      withinvars=c("association_strength",
+                                   "trial_outcome",
+                                   "component",
+                                   "power_bin"),
+                      idvar="subjectId") %>%
+      ggplot(aes(x = as.numeric(as.character(power_bin)),
+                 y = component_score,
+                 color = trial_outcome,
+                 fill = trial_outcome)) +
+      geom_line(linewidth=0.8) +
+      geom_point(size=1.5) +
+      geom_errorbar(aes(ymin=component_score-se, ymax=component_score+se),
+                    width=0.2) +
+      facet_grid(cols = vars(association_strength),
+                 scales = "free") +
+      scale_color_manual(values=c("#1a75ff", "#ff751a"), name="") + 
+      scale_fill_manual(values=c("#1a75ff", "#ff751a"), name="") + 
+      labs(y = paste(pc, "score"), x = paste(y_axis_power_label, "quintile"),
+           title = paste("Power cluster:", this.cluster, sep=" "))
+    
+    all.binned.plts[[length(all.binned.plts)+1]] <- lm.plt
+    all.pc.plts[[pc]] <- lm.plt 
+    
+    this.term <- (mod.data %>% select(term) %>% unique())$term
+    if (this.term == "Mismatch v. Match") {
+      this.color <- "#9E0059"
+    } else if (this.term == "Memory strength (Weak v. Strong)") {
+      this.color <- "#1A936F"
+    } else {
+      this.color <- "#FFD131"
+    }
+    
+    design <- "
+    ##2222
+    112222
+    112222
+    112222
+    ##2222
+    ###33#
+    ###33#
+    ###33#
+    "
+    
+    beta.plt <- betas.df %>% 
+      dplyr::filter(term == as.character(this.term)) %>% 
+      ggplot(aes(x=as.numeric(as.character(time)), 
+                 y=estimate,
+                 color=term,
+                 fill=term)) + 
+      geom_ribbon(aes(ymin=estimate-se, ymax=estimate+se),
+                  color=NA,
+                  alpha=0.3) +
+      geom_line(linewidth = 0.6, color=this.color) +
+      geom_vline(xintercept = c(0, 1, 2, 2.75),
+                 linetype = "dashed",
+                 color = "gray37") +
+      geom_hline(yintercept = c(0),
+                 linetype = "longdash",
+                 color = "gray37") +
+      # mark significant difference
+      geom_point(aes(x = time,
+                     y = ypos),
+                 color = this.color,
+                 show.legend = F,
+                 data = results.betas %>% 
+                   dplyr::filter(cluster_id == this.cluster),
+                 size = 1) +
+      labs(x = "Time (s)",
+           y = paste("Power", greek.beta),
+           title = "Strength") +
+      guides(color="none",
+             fill="none") + 
+      facet_wrap(~term, ncol=1, scales="free_y", strip.position="top") +
+      scale_color_manual(values=this.color, name="") + 
+      scale_fill_manual(values=this.color, name="") + 
+      theme(strip.text.x = element_blank(),
+            axis.line.y=element_blank(),
+            axis.text.x=element_text(size=8.5),
+            axis.text.y=element_blank(),
+            axis.ticks.y=element_blank(),
+            axis.title = element_text(size=8.5),
+            strip.background=element_rect(colour=NA),
+            plot.title = element_text(size=8.5, hjust = 0.5))
+    
+    (all.pc.loading.plts[[pc]] + 
+        all.pc.plts[[pc]] + theme(plot.title = element_blank()) +
+        beta.plt + 
+        plot_layout(design=design, guides="collect", axes="collect") & 
+        theme()) %>% 
+      print()
+    
+    title <- paste("Cluster: ", this.cluster, "; ", pc, sep="")
+    
+    mod <- mod.data %>%
+      mutate(trial_outcome = factor(trial_outcome, 
+                                    levels=c("Match", "Mismatch"))) %>%
+      lmer(component_score ~ power * trial_outcome +
+             (power * trial_outcome | subjectId),
+           data = .)
+    
+    if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+      mod <- mod.data %>%
+        mutate(trial_outcome = factor(trial_outcome, 
+                                      levels=c("Match", "Mismatch"))) %>%
+        lmer(component_score ~ power * trial_outcome  +
+               (power + trial_outcome | subjectId),
+             data = .)
+    }
+    
+    if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+      mod <- mod.data %>%
+        mutate(trial_outcome = factor(trial_outcome, 
+                                      levels=c("Match", "Mismatch"))) %>%
+        lmer(component_score ~ power * trial_outcome  +
+               (1 | subjectId),
+             data = .)
+    }
+    
+    title <- formula(mod)[3]
+    
+    tidy(mod, effects = "fixed", conf.int = T, conf.level = 0.95) %>% 
+      select(term, estimate, conf.low, conf.high, p.value, std.error, df) %>% 
+      kable(caption=paste(pc, ": ", title, sep=""),
+            digits=3) %>% 
+      kable_styling() %>%
+      cat()
+    
+    slopes <- emtrends(mod, pairwise ~ trial_outcome, var = "power")
+    
+    slopes %>% summary() %>% print()
+    
+    tidy(slopes$emtrends, conf.int = T, conf.level = 0.95) %>%
+      kable(caption=paste("slopes: pupil PC ~ ", title, sep=""),
+            digits=3) %>%
+      kable_styling() %>%
+      cat()
+    
+    tidy(mod, effects = "ran_pars", scales = "vcov") %>% 
+      select(term, estimate) %>% 
+      kable(digits=3, caption="Random effects") %>% 
+      kable_styling() %>% 
+      cat()
+    
+  }
+  
+  
+  # cognitive effort and memory reinstatement
+  if ((power_name == "frontal-theta" & this.cluster == 3) |
+      (power_name == "posterior-alpha" & this.cluster == 3) | 
+      (power_name == "posterior-alpha" & this.cluster == 4) | 
+      (power_name == "posterior-alpha" & this.cluster == 5)) {
+    
+    design <- "
+      ##2222##4444
+      ##2222##4444
+      112222664444
+      112222664444
+      ##2222##4444
+      ###33####55#
+      ###33####55#
+    "
+    
+    beta.plt <- betas.df %>% 
+      dplyr::filter(term == "Memory strength (Weak v. Strong)") %>% 
+      ggplot(aes(x=as.numeric(as.character(time)), 
+                 y=estimate,
+                 color=term,
+                 fill=term)) + 
+      geom_ribbon(aes(ymin=estimate-se, ymax=estimate+se),
+                  color=NA,
+                  alpha=0.3) +
+      geom_line(linewidth = 0.6, color=this.color) +
+      geom_vline(xintercept = c(0, 1, 2, 2.75),
+                 linetype = "dashed",
+                 color = "gray37") +
+      geom_hline(yintercept = c(0),
+                 linetype = "longdash",
+                 color = "gray37") +
+      # mark significant difference
+      geom_point(aes(x = time,
+                     y = ypos),
+                 color = this.color,
+                 show.legend = F,
+                 data = results.betas %>% 
+                   dplyr::filter(cluster_id == this.cluster),
+                 size = 1) +
+      labs(x = "Time (s)",
+           y = paste("Power", greek.beta),
+           title = "Strength") +
+      guides(color="none",
+             fill="none") + 
+      facet_wrap(~term, ncol=1, scales="free_y", strip.position="top") +
+      scale_color_manual(values=beta_palette[3], name="") + 
+      scale_fill_manual(values=beta_palette[3], name="") + 
+      theme(strip.text.x = element_blank(),
+            axis.line.y=element_blank(),
+            axis.text.x=element_text(size=8.5),
+            axis.text.y=element_blank(),
+            axis.ticks.y=element_blank(),
+            axis.title = element_text(size=8.5),
+            strip.background=element_rect(colour=NA),
+            plot.title = element_text(size=8.5, hjust = 0.5))
+    
+    
+    (all.pc.loading.plts[["PC1"]] +
+        all.pc.plts[["PC1"]] + theme(plot.title = element_blank()) +
+        beta.plt + 
+        all.pc.plts[["PC5"]] + theme(plot.title = element_blank()) +
+        beta.plt + 
+        all.pc.loading.plts[["PC5"]] + 
+        guides(color=guide_legend(nrow=1)) + 
+        plot_layout(design=design, guides="collect", axes="collect") & 
+        theme(legend.position = "top")) %>% 
+      print()
+    
+    
+    beta.plt <- betas.df %>% 
+      dplyr::filter(term == "Memory strength (Weak v. Strong)") %>% 
+      ggplot(aes(x=as.numeric(as.character(time)), 
+                 y=estimate,
+                 color=term,
+                 fill=term)) + 
+      geom_ribbon(aes(ymin=estimate-se, ymax=estimate+se),
+                  color=NA,
+                  alpha=0.3) +
+      geom_line(linewidth = 0.6, color=this.color) +
+      geom_vline(xintercept = c(0, 1, 2, 2.75),
+                 linetype = "dashed",
+                 color = "gray37") +
+      geom_hline(yintercept = c(0),
+                 linetype = "longdash",
+                 color = "gray37") +
+      # mark significant difference
+      geom_point(aes(x = time,
+                     y = ypos),
+                 color = this.color,
+                 show.legend = F,
+                 data = results.betas %>% 
+                   dplyr::filter(cluster_id == this.cluster),
+                 size = 1) +
+      labs(x = "Time (s)",
+           y = paste("Power", greek.beta),
+           title = "Strength") +
+      guides(color="none",
+             fill="none") + 
+      facet_wrap(~term, ncol=1, scales="free_y", strip.position="top") +
+      scale_color_manual(values=beta_palette[3], name="") + 
+      scale_fill_manual(values=beta_palette[3], name="") + 
+      theme(strip.text.x = element_blank(),
+            axis.line.y=element_blank(),
+            axis.text.x=element_text(size=8.5),
+            axis.text.y=element_blank(),
+            axis.ticks.y=element_blank(),
+            axis.title = element_text(size=8.5),
+            strip.background=element_rect(colour=NA),
+            plot.title = element_text(size=8.5, hjust = 0.5))
+    
+    
+    (all.pc.loading.plts[["PC3"]] +
+        all.pc.plts[["PC3"]] + theme(plot.title = element_blank()) +
+        beta.plt + 
+        all.pc.plts[["PC4"]] + theme(plot.title = element_blank()) +
+        beta.plt + 
+        all.pc.loading.plts[["PC4"]] + 
+        guides(color=guide_legend(nrow=1)) + 
+        plot_layout(design=design, guides="collect", axes="collect") & 
+        theme(legend.position = "top")) %>% 
+      print()
+  }
+  
+  # mnemonic prediction error 
+  if ((power_name == "frontal-theta" & this.cluster == 7) | 
+      (power_name == "posterior-alpha" & this.cluster == 8)) {
+    design <- "
+      ##2222##4444
+      ##2222##4444
+      112222664444
+      112222664444
+      ##2222##4444
+      ###33####55#
+      ###33####55#
+    "
+    
+    beta.plt <- betas.df %>% 
+      dplyr::filter(term == "Mismatch effect x Memory strength") %>% 
+      ggplot(aes(x=as.numeric(as.character(time)), 
+                 y=estimate,
+                 color=term,
+                 fill=term)) + 
+      geom_ribbon(aes(ymin=estimate-se, ymax=estimate+se),
+                  color=NA,
+                  alpha=0.3) +
+      geom_line(linewidth = 0.6, color=this.color) +
+      geom_vline(xintercept = c(0, 1, 2, 2.75),
+                 linetype = "dashed",
+                 color = "gray37") +
+      geom_hline(yintercept = c(0),
+                 linetype = "longdash",
+                 color = "gray37") +
+      # mark significant difference
+      geom_point(aes(x = time,
+                     y = ypos),
+                 color = this.color,
+                 show.legend = F,
+                 data = results.betas %>% 
+                   dplyr::filter(cluster_id == this.cluster),
+                 size = 1) +
+      labs(x = "Time (s)",
+           y = paste("Power", greek.beta),
+           title = "Mismatch x Strength") +
+      guides(color="none",
+             fill="none") + 
+      facet_wrap(~term, ncol=1, scales="free_y", strip.position="top") +
+      scale_color_manual(values=beta_palette[4], name="") + 
+      scale_fill_manual(values=beta_palette[4], name="") + 
+      theme(strip.text.x = element_blank(),
+            axis.line.y=element_blank(),
+            axis.text.x=element_text(size=8.5),
+            axis.text.y=element_blank(),
+            axis.ticks.y=element_blank(),
+            axis.title = element_text(size=8.5),
+            strip.background=element_rect(colour=NA),
+            plot.title = element_text(size=8.5, hjust = 0.5))
+    
+    
+    (all.pc.loading.plts[["PC3"]] +
+        all.pc.plts[["PC3"]] + theme(plot.title = element_blank()) +
+        beta.plt + 
+        all.pc.plts[["PC4"]] + theme(plot.title = element_blank()) +
+        beta.plt + 
+        all.pc.loading.plts[["PC4"]] + 
+        guides(color=guide_legend(nrow=1)) + 
+        plot_layout(design=design, guides="collect", axes="collect") & 
+        theme(legend.position = "top")) %>% 
+      print()
+    
+    beta.plt <- betas.df %>% 
+      dplyr::filter(term == "Mismatch effect x Memory strength") %>% 
+      ggplot(aes(x=as.numeric(as.character(time)), 
+                 y=estimate,
+                 color=term,
+                 fill=term)) + 
+      geom_ribbon(aes(ymin=estimate-se, ymax=estimate+se),
+                  color=NA,
+                  alpha=0.3) +
+      geom_line(linewidth = 0.6, color=this.color) +
+      geom_vline(xintercept = c(0, 1, 2, 2.75),
+                 linetype = "dashed",
+                 color = "gray37") +
+      geom_hline(yintercept = c(0),
+                 linetype = "longdash",
+                 color = "gray37") +
+      # mark significant difference
+      geom_point(aes(x = time,
+                     y = ypos),
+                 color = this.color,
+                 show.legend = F,
+                 data = results.betas %>% 
+                   dplyr::filter(cluster_id == this.cluster),
+                 size = 1) +
+      labs(x = "Time (s)",
+           y = paste("Power", greek.beta),
+           title = "Mismatch x Strength") +
+      guides(color="none",
+             fill="none") + 
+      facet_wrap(~term, ncol=1, scales="free_y", strip.position="top") +
+      scale_color_manual(values=beta_palette[4], name="") + 
+      scale_fill_manual(values=beta_palette[4], name="") + 
+      theme(strip.text.x = element_blank(),
+            axis.line.y=element_blank(),
+            axis.text.x=element_text(size=8.5),
+            axis.text.y=element_blank(),
+            axis.ticks.y=element_blank(),
+            axis.title = element_text(size=8.5),
+            strip.background=element_rect(colour=NA),
+            plot.title = element_text(size=8.5, hjust = 0.5))
+    
+    
+    (all.pc.loading.plts[["PC1"]] +
+        all.pc.plts[["PC1"]] + theme(plot.title = element_blank()) +
+        beta.plt + 
+        all.pc.plts[["PC5"]] + theme(plot.title = element_blank()) +
+        beta.plt + 
+        all.pc.loading.plts[["PC5"]] + 
+        guides(color=guide_legend(nrow=1)) + 
+        plot_layout(design=design, guides="collect", axes="collect") & 
+        theme(legend.position = "top")) %>% 
+      print()
+  }
+  
+}
+
+```
+
+```{r echo=F, fig.width=3, fig.height=2.8, eval=F}
+for (fig in all.binned.plts) {
+  (fig + 
+     theme(plot.title=element_blank(),
+           legend.position = "none")) %>% 
+     print()
+}
+```
+
+# Save
+
+```{r save_data, echo=T}
+save(mean.pupil.models,
+     pc.pupil.models,
+     file=paste("power", power_name, "pupil_models.RData", sep="_"))
+
+rm(pupil.power.data)
+```
