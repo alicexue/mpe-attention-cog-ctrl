@@ -201,7 +201,7 @@ kable(data_recog %>%
         mutate(is_miss = is_old & (old_new_rsp=="new")) %>%
         mutate(is_correct_rejection = !is_old & (old_new_rsp=="new")) %>%
         mutate(no_response = is.na(rt)) %>%
-        group_by(subjectId, association_strength) %>%
+        group_by(subjectId, expId, association_strength) %>%
         summarize(n_hit = sum(is_hit, na.rm=T) / 
                     (sum(is_hit, na.rm=T) + sum(is_miss, na.rm=T)) * 100, 
                   n_fa = sum(is_false_alarm, na.rm=T) / 
@@ -213,7 +213,7 @@ kable(data_recog %>%
                     (sum(is_false_alarm, na.rm=T) + 
                        sum(is_correct_rejection, na.rm=T)) * 100) %>%
         ungroup() %>% 
-        group_by(association_strength) %>%
+        group_by(expId, association_strength) %>%
         summarize(hit = sprintf("%.1f", mean(n_hit, na.rm=T)), 
                   sd_hit = sprintf("(%.1f)", sd(n_hit, na.rm=T)),
                   fa = sprintf("%.1f", mean(n_fa, na.rm=T)), 
@@ -226,10 +226,10 @@ kable(data_recog %>%
         mutate(across(everything(), ~replace(., . == "NaN", " "))) %>% 
         mutate(across(everything(), ~replace(., . == "NA", " "))) %>% 
         mutate(across(everything(), ~replace(., . == "(NA)", " "))) %>% 
-        arrange(match(association_strength, c("Strong (4x)", "Weak (1x)", "Familiar item", "Novel"))) %>% 
-        select(association_strength, hit, sd_hit, fa, sd_fa, 
+        arrange(desc(expId), match(association_strength, c("Strong (4x)", "Weak (1x)", "Familiar item", "Novel"))) %>% 
+        select(expId, association_strength, hit, sd_hit, fa, sd_fa, 
                miss, sd_miss, cr, sd_cr),
-      col.names = c("association_strength", "% hit", "(sd)", "% fa", "(sd)", 
+      col.names = c("expId", "association_strength", "% hit", "(sd)", "% fa", "(sd)", 
                     "% miss", "(sd)", "% cr", "(sd)")) %>%
   kable_styling(bootstrap_options = "striped", 
                 full_width = F, 
@@ -647,8 +647,9 @@ tidy(mod, effects = "fixed", conf.int = T, conf.level = 0.95) %>%
 
 tidy(anova(mod))
 
-emm <- emmeans(mod, ~ association_strength | expId, adjust="bonferroni")
+emm <- emmeans(mod, ~ association_strength | expId, lmerTest.limit = 10346)
 emm.pairs <- pairs(emm)
+print(emm.pairs)
 tidy(emm.pairs, effects = "fixed", conf.int = T, conf.level = 0.95) %>% 
   select(expId, contrast, estimate, conf.low, conf.high, adj.p.value, std.error) %>% 
   kable(digits=3, caption="Recog d-prime comparisons") %>% 
@@ -764,8 +765,9 @@ tidy(ret.rt.mod, effects = "fixed", conf.int = T, conf.level = 0.95) %>%
   kable(caption=paste(formula(ret.rt.mod)[3]), digits=3)%>% 
   kable_styling()
 
-emm <- emmeans(ret.rt.mod, ~ is_mismatch | association_strength | incorrect.ret, adjust="bonferroni")
+emm <- emmeans(ret.rt.mod, ~ is_mismatch | association_strength | incorrect.ret, lmerTest.limit = 10346)
 emm.pairs <- pairs(emm)
+print(emm.pairs)
 tidy(emm.pairs, effects = "fixed", conf.int = T, conf.level = 0.95) %>% 
   select(association_strength, incorrect.ret, contrast, estimate, conf.low, conf.high, p.value, std.error) %>% 
   kable(digits=3, caption="Retrieval match/mismatch RT differences") %>% 
@@ -790,8 +792,9 @@ tidy(ret.rt.mod, effects = "fixed", conf.int = T, conf.level = 0.95) %>%
   kable(caption=paste(formula(ret.rt.mod)[3]), digits=3)%>% 
   kable_styling()
 
-emm <- emmeans(ret.rt.mod, ~ is_mismatch | association_strength | incorrect.ret | expId, adjust="bonferroni")
+emm <- emmeans(ret.rt.mod, ~ is_mismatch | association_strength | incorrect.ret | expId, lmerTest.limit = 10346)
 emm.pairs <- pairs(emm)
+print(emm.pairs)
 tidy(emm.pairs, effects = "fixed", conf.int = T, conf.level = 0.95) %>% 
   select(expId, association_strength, incorrect.ret, contrast, estimate, conf.low, conf.high, p.value, std.error) %>% 
   kable(digits=3, caption="Retrieval match/mismatch RT differences") %>% 
@@ -842,14 +845,14 @@ tidy(recog.rt.mod, effects = "fixed", conf.int = T, conf.level = 0.95) %>%
   kable(caption=paste("Recognition RT ~", formula(recog.rt.mod)[3]), digits=3)%>% 
   kable_styling()
 
-emm <- emmeans(recog.rt.mod, ~ association_strength | incorrect.recog | expId, adjust="bonferroni")
+emm <- emmeans(recog.rt.mod, ~ association_strength | incorrect.recog | expId, lmerTest.limit = 10346)
 emm.pairs <- pairs(emm)
 tidy(emm.pairs, effects = "fixed", conf.int = T, conf.level = 0.95) %>% 
   select(expId,incorrect.recog, contrast, estimate, conf.low, conf.high, adj.p.value, std.error) %>% 
   kable(digits=3, caption="Recognition RT main effects") %>% 
   kable_styling()
 
-emm <- emmeans(recog.rt.mod, ~ association_strength * incorrect.recog | expId, adjust="bonferroni")
+emm <- emmeans(recog.rt.mod, ~ association_strength * incorrect.recog | expId, lmerTest.limit = 10346)
 con <- contrast(emm, interaction = "pairwise")
 tidy(con, effects = "fixed", conf.int = T, conf.level = 0.95) %>% 
   select(expId, association_strength_pairwise, incorrect.recog_pairwise, estimate, conf.low, conf.high, p.value, std.error) %>% 

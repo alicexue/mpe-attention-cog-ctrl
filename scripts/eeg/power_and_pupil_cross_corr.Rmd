@@ -1,0 +1,991 @@
+---
+title: "Power and pupil cross-correlations"
+author: "Alice Xue"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+params:
+    exp_id: "MPE"
+    run_models: yes
+    power_name: "frontal-theta"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 3
+    toc_float:
+      collapsed: no
+    self_contained: false
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+---
+
+```{r setup, include=FALSE}
+library(plyr)
+library(Hmisc)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+library(data.table)
+library(psycho)
+library(lme4)
+library(sjPlot)
+library(afex)
+library(wesanderson)
+library(viridis)
+library(showtext)
+library(tidyverse)
+library(mgcv)
+library(itsadug)
+library(RColorBrewer)
+library(ggcorrplot)
+library(devtools)
+library(factoextra)
+library(tidyjson)
+library(purrr)
+library(broom)
+library(zoo)
+library(psych)
+library(patchwork)
+library(emmeans)
+library(ggpubr)
+library(stats)
+library(broom.mixed)
+library(pracma)
+library(afex)
+library(fuzzyjoin)
+
+font_add(family = "Avenir Next",
+         regular = "../utils/AvenirNext-Regular.ttf",
+         bold = "../utils/AvenirNext-DemiBold.ttf",
+         italic = "../utils/AvenirNext-Italic.ttf")
+showtext.auto()
+
+fontfamily <- "Avenir Next"
+
+set_theme(
+  base=theme_classic(base_size = 12,
+                     base_family="Avenir Next",
+                     base_line_size = 12/30,
+                     base_rect_size = 12/30)
+)
+
+options(dplyr.summarise.inform = FALSE)
+
+knitr::opts_chunk$set(echo = TRUE, 
+                      warning=FALSE, 
+                      message = FALSE, 
+                      fig.showtext=TRUE)
+
+# knitr::opts_chunk$set(dev = 'pdf') # set output device to pdf
+
+source("../utils/summary_se_utils.R")
+```
+
+```{r get_behavior, echo=F}
+set.seed(478)
+
+fr.theta.hits <- fread("../../data/eeg/MPE_frontal_theta_asso_retrieval_Hit.csv")
+fr.theta.crs <- fread("../../data/eeg/MPE_frontal_theta_asso_retrieval_CR.csv")
+po.alpha.hits <- fread("../../data/eeg/MPE_posterior_alpha_asso_retrieval_Hit.csv")
+po.alpha.crs <- fread("../../data/eeg/MPE_posterior_alpha_asso_retrieval_CR.csv")
+
+fr.theta.power <- bind_rows(
+  list(
+    fr.theta.hits, 
+    fr.theta.crs)) %>% 
+  mutate(trial_outcome = recode(trial_outcome,
+                                Hit = "Match",
+                                CR = "Mismatch"))
+
+po.alpha.power <- bind_rows(
+  list(
+    po.alpha.hits,
+    po.alpha.crs)) %>% 
+  mutate(trial_outcome = recode(trial_outcome,
+                                Hit = "Match",
+                                CR = "Mismatch"))
+
+rm(fr.theta.hits, 
+   fr.theta.crs,
+   po.alpha.hits,
+   po.alpha.crs)
+
+greek.beta <- "\u03B2"
+```
+
+```{r labels, echo=F}
+palette <- c("#008080", "#9fdfbf")
+beta_palette <- c("#A7A2A9", "#9E0059", "#1A936F", "#FFD131")
+org_blue_rep_palette <- c("#1a75ff", "#ff751a", "#1a75ff", "#ff751a")
+fr_theta_clr <- "#88cc00"
+po_alpha_clr <- "#5f46aa"
+pupil_clr <- "#4678aa"
+
+sfreq <- 0.008
+```
+
+```{r load_pupil, echo=F}
+retrieval_pupil <- fread("../../data/pupil/MPE_imm_retrieval_pupil.csv") %>% 
+  mutate(trial_outcome = recode(trial_outcome,
+                                Hit = "Match",
+                                CR = "Mismatch"))
+```
+
+```{r}
+pupil.power.data <- fr.theta.power %>% 
+  left_join(po.alpha.power,
+            by = c("subjectId", 
+                   "trialN",
+                   "trial_outcome", 
+                   "association_strength", 
+                   "match_response.rt",
+                   "time"),
+            suffix = c(".frontal_theta", ".posterior_alpha")) %>% 
+  select(subjectId, 
+         trialN,
+         trial_outcome, 
+         association_strength, 
+         match_response.rt,
+         time,
+         power.frontal_theta,
+         power.posterior_alpha) %>% 
+  left_join(retrieval_pupil,
+            by = c("subjectId", 
+                   "trialN",
+                   "trial_outcome", 
+                   "association_strength", 
+                   "match_response.rt",
+                   "time"),
+            suffix = c("", ".pupil")) 
+
+```
+
+```{r, echo=F}
+pupil.power.data <- pupil.power.data %>% 
+  group_by(subjectId, trialN) %>% 
+  mutate(n_pupil_points = sum(is.na(pupil_diameter_z))) %>% 
+  ungroup() %>% 
+  dplyr::filter(n_pupil_points == 400) %>% 
+  group_by(subjectId, trialN) %>% 
+  arrange(time) %>% 
+  mutate(pupil_diameter_z = na.approx(pupil_diameter_z)) %>% # linear interpolation
+  ungroup()
+```
+
+```{r, echo=F}
+pupil_summarized <- pupil.power.data %>% 
+  group_by(time,
+           subjectId,
+           association_strength,
+           customlinetype,
+           trial_outcome) %>% 
+  summarize(pupil_diameter_z = mean(pupil_diameter_z)) %>% 
+  ungroup() 
+
+pupil_summarized %>% 
+  summarySEwithin(.,
+                  measurevar="pupil_diameter_z",
+                  withinvars=c("association_strength",
+                               "trial_outcome",
+                               "time"),
+                  idvar="subjectId") %>%
+  ggplot(aes(x = as.numeric(as.character(time)), 
+             y = pupil_diameter_z,
+             color = association_strength,
+             fill = association_strength)) +
+  geom_ribbon(aes(ymin=pupil_diameter_z-se, ymax=pupil_diameter_z+se),
+              color=NA,
+              alpha=0.3) +
+  geom_line(#aes(linetype = factor(customlinetype)),
+    linewidth = 1) +
+  geom_vline(xintercept = c(0, 1, 2, 2.75),
+             linetype = "dashed",
+             color = "gray37") +
+  labs(x = "Time (s)",
+       y = "Pupil diameter (z)",
+       title = "") +
+  facet_wrap(~factor(trial_outcome), nrow=2) +
+  guides(linetype = "none") + 
+  scale_color_manual(values=palette, name="") + 
+  scale_fill_manual(values=palette, name="") + 
+  theme(strip.text.x = element_text(size=12))
+```
+
+### Frontal theta and pupil
+
+```{r, echo=F, fig.width=3.5, fig.height=3}
+title <- "Cross correlation between\nfrontal theta and pupil"
+
+ccf.data <- pupil.power.data %>% 
+  dplyr::filter(trial_outcome == "Mismatch", association_strength == "Strong (4x)") %>% 
+  group_by(subjectId, trialN, trial_outcome, association_strength) %>%
+  arrange(time) %>% 
+  group_map(~ {data.frame(subjectId = .y$subjectId,
+                          trialN = .y$trialN,
+                          trial_outcome = .y$trial_outcome,
+                          association_strength = .y$association_strength,
+                          lag = ccf(.x$power.frontal_theta, 
+                                    .x$pupil_diameter_z, 
+                                    lag.max=125,
+                                    plot=F)$lag,
+                          ccf.values = ccf(.x$power.frontal_theta, 
+                                           .x$pupil_diameter_z, 
+                                           lag.max=125,
+                                           plot=F)$acf)}) %>%
+  bind_rows()
+
+ccf.data <- ccf.data %>% 
+  mutate(lag.time = lag/125)
+
+purple_palette <- colorRampPalette(c("#f2e6ff", "#5900b3"))
+colors <- purple_palette(50)
+
+ccf.data %>% 
+  group_by(subjectId, lag.time) %>% 
+  summarize(ccf.values = mean(ccf.values)) %>% 
+  ggplot(aes(x = as.numeric(as.character(lag.time)), 
+             y = ccf.values)) +
+  geom_line(aes(
+    color = subjectId,
+    fill = subjectId),
+    linewidth = 0.5, alpha=0.4,) +
+  stat_summary(fun = "mean", 
+               geom = "line", 
+               color = "black",
+               linewidth = 1) +
+  stat_summary(fun = "se", 
+               geom = "errorbar") +
+  labs(x = "Lag time (s)",
+       y = "Correlation coef.",
+       title = title) +
+  guides(color = "none") +
+  scale_color_manual(values=colors, name="")
+
+ccf.data %>% 
+  dplyr::filter(trial_outcome == "Mismatch", association_strength == "Strong (4x)") %>% 
+  group_by(subjectId, lag.time, trial_outcome, association_strength) %>% 
+  summarize(ccf.values = mean(ccf.values)) %>% 
+  ggplot(aes(x = as.numeric(as.character(lag.time)), 
+             y = ccf.values,
+             color=trial_outcome)) +
+  geom_line(aes(group=subjectId),
+            linewidth = 0.5, alpha=0.4) +
+  stat_summary(fun = "mean", 
+               geom = "line", 
+               color = "black",
+               linewidth = 1) +
+  stat_summary(fun = "se", 
+               geom = "errorbar") +
+  labs(x = "Lag time (s)",
+       y = "Correlation coef.",
+       title = title) +
+  facet_grid(rows=vars(association_strength),
+             cols=vars(trial_outcome)) +
+  guides(color = "none") +
+  scale_color_manual(values=c("#ff751a"), name="")
+
+```
+
+```{r, echo=F, fig.width=5.5, fig.height=5}
+stats.ccf <- ccf.data %>% 
+  group_by(subjectId, lag, lag.time, trial_outcome, association_strength) %>% 
+  summarize(corr.coef = mean(ccf.values, na.rm = TRUE), .groups = "drop_last") %>% 
+  dplyr::filter(trial_outcome == "Mismatch", association_strength == "Strong (4x)") %>% 
+  group_by(lag, lag.time, trial_outcome, association_strength) %>% 
+  summarize(p.value = t.test(corr.coef)$p.value, 
+            mean.corr.coef = mean(corr.coef),
+            .groups = "drop") %>% 
+  mutate(p.value.bonf = p.adjust(p.value, method = "bonferroni")) %>% 
+  dplyr::filter(p.value.bonf < 0.05)
+
+clusters <- stats.ccf %>% 
+  mutate(trial_outcome = paste(association_strength, trial_outcome)) %>% 
+  mutate(time = round(lag.time, 3)) %>% 
+  group_by(trial_outcome) %>% 
+  mutate(time_diff = c(NA, diff(time))) %>% 
+  mutate(time_diff_back = lead(time_diff)) %>% 
+  mutate(time_diff = round(time_diff, 3),
+         time_diff_back = round(time_diff_back, 3)) %>% 
+  dplyr::filter(time_diff > sfreq | time_diff_back > sfreq | is.na(time_diff) | is.na(time_diff_back)) %>% 
+  ungroup() %>% 
+  select(trial_outcome, time, time_diff, time_diff_back) %>% 
+  # mutate(across(trial_outcome,
+  #               factor,
+  #               level=level_order)) %>% 
+  arrange(trial_outcome, time) %>% 
+  mutate(is_solo_point = ifelse(is.na(time_diff) & time_diff_back > sfreq, T, F)) %>% 
+  group_by(trial_outcome, is_solo_point) %>% 
+  mutate(index_parity = if_else(row_number() %% 2 == 1, "start.time", "end.time")) %>% 
+  mutate(time_period = round(row_number()+1/2) / 2) %>% 
+  ungroup() %>% 
+  select(-time_diff, -time_diff_back) %>% 
+  pivot_wider(names_from=c("index_parity"),
+              values_from = "time") %>% 
+  select(-time_period, -is_solo_point) %>% 
+  mutate(cluster_id = row_number())
+
+clusters %>% 
+  kable() %>% 
+  kable_styling()
+
+if (nrow(clusters) > 0) {
+  fuzzy_left_join(
+    stats.ccf %>% 
+      mutate(term = paste(association_strength, trial_outcome)) %>% 
+      select(-trial_outcome), 
+    clusters %>% 
+      mutate(cluster.term = as.character(trial_outcome)) %>% 
+      select(-trial_outcome),
+    by = c("lag.time" = "start.time", "lag.time" = "end.time", "term" = "cluster.term"),
+    match_fun = list(`>=`, `<=`, `==`)
+  ) %>% 
+    group_by(cluster_id) %>% 
+    summarize(start.time = mean(start.time),
+              end.time = mean(end.time),
+              corr.coef = mean(mean.corr.coef),
+              se = sd(mean.corr.coef) / sqrt(n()),
+              lower_ci = corr.coef - 1.96 * se,
+              upper_ci = corr.coef + 1.96 * se) %>% 
+    kable(digits=3) %>% 
+    kable_styling() %>% 
+    cat()
+  
+  times <- clusters %>% 
+    mutate(cluster_id = row_number()) %>% 
+    pivot_longer(cols=c("start.time", "end.time"),
+                 names_to="center_time",
+                 values_to="time") %>% 
+    group_by(trial_outcome, cluster_id) %>% 
+    summarize(center_time = mean(time)) %>% 
+    ungroup()
+  
+  times %>% 
+    kable() %>% 
+    kable_styling() %>% 
+    cat()
+  
+  plt <- ccf.data %>% 
+    group_by(subjectId, lag.time, trial_outcome, association_strength) %>% 
+    summarize(ccf.values = mean(ccf.values)) %>% 
+    ggplot(aes(x = as.numeric(as.character(lag.time)), 
+               y = ccf.values,
+               color=trial_outcome)) +
+    geom_line(aes(group=subjectId),
+              linewidth = 0.5, alpha=0.4) +
+    # mark significant difference
+    geom_point(aes(x = lag.time,
+                   y = -0.3,
+                   color=trial_outcome,
+                   fill=trial_outcome),
+               show.legend = F,
+               data = stats.ccf,
+               shape = 15,
+               size = 0.5) +
+    stat_summary(fun = "mean", 
+                 geom = "line", 
+                 color = "black",
+                 linewidth = 1) +
+    stat_summary(fun = "se", 
+                 geom = "errorbar") +
+    labs(x = "Lag time (s)",
+         y = "Correlation coef.",
+         title = title) +
+    facet_grid(rows=vars(association_strength),
+               cols=vars(trial_outcome)) +
+    guides(color = "none") +
+    scale_color_manual(values=c("#ff751a"), name="") 
+  
+  print(plt)
+}
+```
+
+### Posterior alpha and pupil
+
+```{r, echo=F, fig.width=3.5, fig.height=3}
+title <- "Cross correlation between\nposterior alpha and pupil"
+
+ccf.data <- pupil.power.data %>% 
+  dplyr::filter(trial_outcome == "Mismatch", association_strength == "Strong (4x)") %>% 
+  group_by(subjectId, trialN, trial_outcome, association_strength) %>%
+  arrange(time) %>% 
+  group_map(~ {data.frame(subjectId = .y$subjectId,
+                          trialN = .y$trialN,
+                          trial_outcome = .y$trial_outcome,
+                          association_strength = .y$association_strength,
+                          lag = ccf(.x$power.posterior_alpha, 
+                                    .x$pupil_diameter_z, 
+                                    lag.max=125,
+                                    plot=F)$lag,
+                          ccf.values = ccf(.x$power.posterior_alpha, 
+                                           .x$pupil_diameter_z, 
+                                           lag.max=125,
+                                           plot=F)$acf)}) %>%
+  bind_rows()
+
+ccf.data <- ccf.data %>% 
+  mutate(lag.time = lag/125)
+
+purple_palette <- colorRampPalette(c("#f2e6ff", "#5900b3"))
+colors <- purple_palette(50)
+
+ccf.data %>% 
+  group_by(subjectId, lag.time) %>% 
+  summarize(ccf.values = mean(ccf.values)) %>% 
+  ggplot(aes(x = as.numeric(as.character(lag.time)), 
+             y = ccf.values)) +
+  geom_line(aes(
+    color = subjectId,
+    fill = subjectId),
+    linewidth = 0.5, alpha=0.4,) +
+  stat_summary(fun = "mean", 
+               geom = "line", 
+               color = "black",
+               linewidth = 1) +
+  stat_summary(fun = "se", 
+               geom = "errorbar") +
+  labs(x = "Lag time (s)",
+       y = "Correlation coef.",
+       title = title) +
+  guides(color = "none") +
+  scale_color_manual(values=colors, name="")
+
+ccf.data %>% 
+  group_by(subjectId, lag.time, trial_outcome, association_strength) %>% 
+  summarize(ccf.values = mean(ccf.values)) %>% 
+  ggplot(aes(x = as.numeric(as.character(lag.time)), 
+             y = ccf.values,
+             color=trial_outcome)) +
+  geom_line(aes(group=subjectId),
+            linewidth = 0.5, alpha=0.4) +
+  stat_summary(fun = "mean", 
+               geom = "line", 
+               color = "black",
+               linewidth = 1) +
+  stat_summary(fun = "se", 
+               geom = "errorbar") +
+  labs(x = "Lag time (s)",
+       y = "Correlation coef.",
+       title = title) +
+  facet_grid(rows=vars(association_strength),
+             cols=vars(trial_outcome)) +
+  guides(color = "none") +
+  scale_color_manual(values=c("#ff751a"), name="")
+
+```
+
+```{r, echo=F, fig.width=5.5, fig.height=5, results="asis"}
+stats.ccf <- ccf.data %>% 
+  group_by(subjectId, lag, lag.time, trial_outcome, association_strength) %>% 
+  summarize(corr.coef = mean(ccf.values, na.rm = TRUE), .groups = "drop_last") %>% 
+  dplyr::filter(trial_outcome == "Mismatch", association_strength == "Strong (4x)") %>% 
+  group_by(lag, lag.time, trial_outcome, association_strength) %>% 
+  summarize(p.value = t.test(corr.coef)$p.value, 
+            mean.corr.coef = mean(corr.coef),
+            .groups = "drop") %>% 
+  mutate(p.value.bonf = p.adjust(p.value, method = "bonferroni")) %>% 
+  dplyr::filter(p.value.bonf < 0.05)
+
+clusters <- stats.ccf %>% 
+  mutate(trial_outcome = paste(association_strength, trial_outcome)) %>% 
+  mutate(time = round(lag.time, 3)) %>% 
+  group_by(trial_outcome) %>% 
+  mutate(time_diff = c(NA, diff(time))) %>% 
+  mutate(time_diff_back = lead(time_diff)) %>% 
+  mutate(time_diff = round(time_diff, 3),
+         time_diff_back = round(time_diff_back, 3)) %>% 
+  dplyr::filter(time_diff > sfreq | time_diff_back > sfreq | is.na(time_diff) | is.na(time_diff_back)) %>% 
+  ungroup() %>% 
+  select(trial_outcome, time, time_diff, time_diff_back) %>% 
+  arrange(trial_outcome, time) %>% 
+  mutate(is_solo_point = ifelse(is.na(time_diff) & time_diff_back > sfreq, T, F)) %>% 
+  group_by(trial_outcome, is_solo_point) %>% 
+  mutate(index_parity = if_else(row_number() %% 2 == 1, "start.time", "end.time")) %>% 
+  mutate(time_period = round(row_number()+1/2) / 2) %>% 
+  ungroup() %>% 
+  select(-time_diff, -time_diff_back) %>% 
+  pivot_wider(names_from=c("index_parity"),
+              values_from = "time") %>% 
+  select(-time_period, -is_solo_point) %>% 
+  mutate(cluster_id = row_number())
+
+clusters %>% 
+  kable() %>% 
+  kable_styling()
+
+if (nrow(clusters) > 0) {
+  fuzzy_left_join(
+    stats.ccf %>% 
+      mutate(term = paste(association_strength, trial_outcome)) %>% 
+      select(-trial_outcome), 
+    clusters %>% 
+      mutate(cluster.term = as.character(trial_outcome)) %>% 
+      select(-trial_outcome),
+    by = c("lag.time" = "start.time", "lag.time" = "end.time", "term" = "cluster.term"),
+    match_fun = list(`>=`, `<=`, `==`)
+  ) %>% 
+    group_by(cluster_id) %>% 
+    summarize(start.time = mean(start.time),
+              end.time = mean(end.time),
+              corr.coef = mean(mean.corr.coef),
+              se = sd(mean.corr.coef) / sqrt(n()),
+              lower_ci = corr.coef - 1.96 * se,
+              upper_ci = corr.coef + 1.96 * se) %>% 
+    kable(digits=3) %>% 
+    kable_styling() %>% 
+    cat()
+  
+  times <- clusters %>% 
+    mutate(cluster_id = row_number()) %>% 
+    pivot_longer(cols=c("start.time", "end.time"),
+                 names_to="center_time",
+                 values_to="time") %>% 
+    group_by(trial_outcome, cluster_id) %>% 
+    summarize(center_time = mean(time)) %>% 
+    ungroup()
+  
+  times %>% 
+    kable() %>% 
+    kable_styling() %>% 
+    cat()
+  
+  plt <- ccf.data %>% 
+    group_by(subjectId, lag.time, trial_outcome, association_strength) %>% 
+    summarize(ccf.values = mean(ccf.values)) %>% 
+    ggplot(aes(x = as.numeric(as.character(lag.time)), 
+               y = ccf.values,
+               color=trial_outcome)) +
+    geom_line(aes(group=subjectId),
+              linewidth = 0.5, alpha=0.4) +
+    # mark significant difference
+    geom_point(aes(x = lag.time,
+                   y = -0.4,
+                   color=trial_outcome,
+                   fill=trial_outcome),
+               show.legend = F,
+               data = stats.ccf,
+               shape = 15,
+               size = 0.5) +
+    stat_summary(fun = "mean", 
+                 geom = "line", 
+                 color = "black",
+                 linewidth = 1) +
+    stat_summary(fun = "se", 
+                 geom = "errorbar") +
+    labs(x = "Lag time (s)",
+         y = "Correlation coef.",
+         title = title) +
+    facet_grid(rows=vars(association_strength),
+               cols=vars(trial_outcome)) +
+    guides(color = "none") +
+    scale_color_manual(values=c("#ff751a"), name="") 
+  
+  print(plt)
+}
+```
+
+### Frontal theta and posterior alpha
+
+```{r, echo=F, fig.width=3.5, fig.height=3}
+title <- "Cross correlation between\nfrontal theta and posterior alpha"
+
+ccf.data <- pupil.power.data %>% 
+  dplyr::filter(trial_outcome == "Mismatch", association_strength == "Strong (4x)") %>% 
+  group_by(subjectId, trialN, trial_outcome, association_strength) %>%
+  arrange(time) %>% 
+  group_map(~ {data.frame(subjectId = .y$subjectId,
+                          trialN = .y$trialN,
+                          trial_outcome = .y$trial_outcome,
+                          association_strength = .y$association_strength,
+                          lag = ccf(.x$power.frontal_theta, 
+                                    .x$power.posterior_alpha, 
+                                    lag.max=125,
+                                    plot=F)$lag,
+                          ccf.values = ccf(.x$power.frontal_theta, 
+                                           .x$power.posterior_alpha, 
+                                           lag.max=125,
+                                           plot=F)$acf)}) %>%
+  bind_rows()
+
+ccf.data <- ccf.data %>% 
+  mutate(lag.time = lag/125)
+
+purple_palette <- colorRampPalette(c("#f2e6ff", "#5900b3"))
+colors <- purple_palette(50)
+
+ccf.data %>% 
+  group_by(subjectId, lag.time) %>% 
+  summarize(ccf.values = mean(ccf.values)) %>% 
+  ggplot(aes(x = as.numeric(as.character(lag.time)), 
+             y = ccf.values)) +
+  geom_line(aes(
+    color = subjectId,
+    fill = subjectId),
+    linewidth = 0.5, alpha=0.4,) +
+  stat_summary(fun = "mean", 
+               geom = "line", 
+               color = "black",
+               linewidth = 1) +
+  stat_summary(fun = "se", 
+               geom = "errorbar") +
+  labs(x = "Lag time (s)",
+       y = "Correlation coef.",
+       title = title) +
+  guides(color = "none") +
+  scale_color_manual(values=colors, name="")
+
+ccf.data %>% 
+  group_by(subjectId, lag.time, trial_outcome, association_strength) %>% 
+  summarize(ccf.values = mean(ccf.values)) %>% 
+  ggplot(aes(x = as.numeric(as.character(lag.time)), 
+             y = ccf.values,
+             color=trial_outcome)) +
+  geom_line(aes(group=subjectId),
+            linewidth = 0.5, alpha=0.4) +
+  stat_summary(fun = "mean", 
+               geom = "line", 
+               color = "black",
+               linewidth = 1) +
+  stat_summary(fun = "se", 
+               geom = "errorbar") +
+  labs(x = "Lag time (s)",
+       y = "Correlation coef.",
+       title = title) +
+  facet_grid(rows=vars(association_strength),
+             cols=vars(trial_outcome)) +
+  guides(color = "none") +
+  scale_color_manual(values=c("#ff751a"), name="")
+
+```
+
+```{r, echo=F, fig.width=4.5, fig.height=4}
+stats.ccf <- ccf.data %>% 
+  group_by(subjectId, lag, lag.time, trial_outcome, association_strength) %>% 
+  summarize(corr.coef = mean(ccf.values, na.rm = TRUE), .groups = "drop_last") %>% 
+  dplyr::filter(trial_outcome == "Mismatch", association_strength == "Strong (4x)") %>% 
+  group_by(lag, lag.time, trial_outcome, association_strength) %>% 
+  summarize(p.value = t.test(corr.coef)$p.value, 
+            mean.corr.coef = mean(corr.coef),
+            .groups = "drop") %>% 
+  mutate(p.value.bonf = p.adjust(p.value, method = "bonferroni")) %>% 
+  dplyr::filter(p.value.bonf < 0.05)
+
+clusters <- stats.ccf %>% 
+  mutate(trial_outcome = paste(association_strength, trial_outcome)) %>% 
+  mutate(time = round(lag.time, 3)) %>% 
+  group_by(trial_outcome) %>% 
+  mutate(time_diff = c(NA, diff(time))) %>% 
+  mutate(time_diff_back = lead(time_diff)) %>% 
+  mutate(time_diff = round(time_diff, 3),
+         time_diff_back = round(time_diff_back, 3)) %>% 
+  dplyr::filter(time_diff > sfreq | time_diff_back > sfreq | is.na(time_diff) | is.na(time_diff_back)) %>% 
+  ungroup() %>% 
+  select(trial_outcome, time, time_diff, time_diff_back) %>% 
+  # mutate(across(trial_outcome,
+  #               factor,
+  #               level=level_order)) %>% 
+  arrange(trial_outcome, time) %>% 
+  mutate(is_solo_point = ifelse(is.na(time_diff) & time_diff_back > sfreq, T, F)) %>% 
+  group_by(trial_outcome, is_solo_point) %>% 
+  mutate(index_parity = if_else(row_number() %% 2 == 1, "start.time", "end.time")) %>% 
+  mutate(time_period = round(row_number()+1/2) / 2) %>% 
+  ungroup() %>% 
+  select(-time_diff, -time_diff_back) %>% 
+  pivot_wider(names_from=c("index_parity"),
+              values_from = "time") %>% 
+  select(-time_period, -is_solo_point) %>% 
+  mutate(cluster_id = row_number())
+
+clusters %>% 
+  kable() %>% 
+  kable_styling()
+
+
+fuzzy_left_join(
+  stats.ccf %>% 
+    mutate(term = paste(association_strength, trial_outcome)) %>% 
+    select(-trial_outcome), 
+  clusters %>% 
+    mutate(cluster_id = row_number()) %>% 
+    mutate(cluster.term = as.character(trial_outcome)) %>% 
+    select(-trial_outcome),
+  by = c("lag.time" = "start.time", "lag.time" = "end.time", "term" = "cluster.term"),
+  match_fun = list(`>=`, `<=`, `==`)
+) %>% 
+  group_by(cluster_id) %>% 
+  summarize(start.time = mean(start.time),
+            end.time = mean(end.time),
+            corr.coef = mean(mean.corr.coef),
+            se = sd(mean.corr.coef) / sqrt(n()),
+            lower_ci = corr.coef - 1.96 * se,
+            upper_ci = corr.coef + 1.96 * se) %>% 
+  kable(digits=3) %>% 
+  kable_styling()
+
+times <- clusters %>% 
+  pivot_longer(cols=c("start.time", "end.time"),
+               names_to="center_time",
+               values_to="time") %>% 
+  group_by(trial_outcome, cluster_id) %>% 
+  summarize(center_time = mean(time)) %>% 
+  ungroup()
+
+times %>% 
+  kable() %>% 
+  kable_styling()
+
+ccf.data %>% 
+  group_by(subjectId, lag.time, trial_outcome, association_strength) %>% 
+  summarize(ccf.values = mean(ccf.values)) %>% 
+  ggplot(aes(x = as.numeric(as.character(lag.time)), 
+             y = ccf.values,
+             color=trial_outcome)) +
+  geom_line(aes(group=subjectId),
+            linewidth = 0.5, alpha=0.4) +
+  # mark significant difference
+  geom_point(aes(x = lag.time,
+                 y = -0.3,
+                 color=trial_outcome,
+                 fill=trial_outcome),
+             show.legend = F,
+             data = stats.ccf,
+             shape = 15,
+             size = 0.5) +
+  stat_summary(fun = "mean", 
+               geom = "line", 
+               color = "black",
+               linewidth = 1) +
+  stat_summary(fun = "se", 
+               geom = "errorbar") +
+  labs(x = "Lag time (s)",
+       y = "Correlation coef.",
+       title = title) +
+  facet_grid(rows=vars(association_strength),
+             cols=vars(trial_outcome)) +
+  guides(color = "none") +
+  scale_color_manual(values=c("#ff751a"), name="")
+
+```
+
+Plot lagged time series for some visualization
+
+```{r, echo=F, fig.height=2.3, fig.width=5}
+
+power.clusters.of.interest <-
+  tibble(start.time = c(0.768, 2.048, 0.952, 2.536),
+         end.time = c(1.744, 2.728, 2.112, 3.376),
+         cluster_type = c("Memory strength (Weak v. Strong)", 
+                          "Mismatch effect x Memory strength",
+                          "Memory strength (Weak v. Strong)", 
+                          "Mismatch effect x Memory strength"),
+         power_type = c("Frontal theta", 
+                        "Frontal theta", 
+                        "Posterior alpha", 
+                        "Posterior alpha")
+  )
+
+for (i in 1:nrow(times)) {
+  
+  this.cluster.condition <- times %>% dplyr::filter(cluster_id == i) %>% pull(trial_outcome)
+  start.time <- clusters %>% dplyr::filter(cluster_id == i) %>% pull(start.time)
+  end.time <- clusters %>% dplyr::filter(cluster_id == i) %>% pull(end.time)
+  time.diff <- times %>% dplyr::filter(cluster_id == i) %>% pull(center_time)
+  if (time.diff > 0) {
+    time.diff <- end.time
+  } else if (time.diff < 0) {
+    time.diff <- start.time
+  }
+  time.diff <- round(time.diff / sfreq) * sfreq
+  
+  lagged.data <- fr.theta.power %>% 
+    full_join(po.alpha.power %>% 
+                mutate(time = time + time.diff),
+              by = c("subjectId", 
+                     "trialN",
+                     "trial_outcome", 
+                     "association_strength", 
+                     "match_response.rt",
+                     "time"),
+              suffix = c(".frontal_theta", ".posterior_alpha")) %>% 
+    select(subjectId, 
+           trialN,
+           trial_outcome, 
+           association_strength, 
+           match_response.rt,
+           time,
+           power.frontal_theta,
+           power.posterior_alpha) %>% 
+    group_by(time,
+             subjectId,
+             association_strength,
+             trial_outcome) %>% 
+    summarize(power.frontal_theta = mean(power.frontal_theta),
+              power.posterior_alpha = mean(power.posterior_alpha)) %>% 
+    ungroup() %>% 
+    mutate(trial_outcome = paste(association_strength, trial_outcome)) %>% 
+    dplyr::filter(trial_outcome == this.cluster.condition)
+  
+  
+  ret_labels <- tibble(event = c("cue", "delay", "probe", "ITI"),
+                       time = c(0, 1, 2, 2.75))
+  ret_labels$position <- 0.052
+  
+  fr.theta.summary <- lagged.data %>% 
+    dplyr::filter(!is.na(power.frontal_theta)) %>% 
+    summarySEwithin(.,
+                    measurevar="power.frontal_theta",
+                    withinvars=c("time"),
+                    idvar="subjectId") %>% 
+    pivot_longer(cols = c("power.frontal_theta"),
+                 values_to = "power",
+                 names_to = "power_type",
+                 names_prefix = "power.") %>% 
+    select(-power.frontal_theta_norm)
+  
+  po.alpha.summary <- lagged.data %>% 
+    dplyr::filter(!is.na(power.posterior_alpha)) %>% 
+    summarySEwithin(.,
+                    measurevar="power.posterior_alpha",
+                    withinvars=c("time"),
+                    idvar="subjectId") %>% 
+    pivot_longer(cols = c("power.posterior_alpha"),
+                 values_to = "power",
+                 names_to = "power_type",
+                 names_prefix = "power.") %>% 
+    select(-power.posterior_alpha_norm)
+  
+  plt <- fr.theta.summary %>% 
+    bind_rows(list(., po.alpha.summary)) %>% 
+    mutate(power_type = recode(power_type,
+                               "frontal_theta" = "Frontal theta",
+                               "posterior_alpha" = "Posterior alpha")) %>% 
+    ggplot(aes(x = as.numeric(as.character(time)), 
+               y = power,
+               color = power_type,
+               fill = power_type)) +
+    geom_ribbon(aes(ymin=power-se, ymax=power+se),
+                color=NA,
+                alpha=0.3) +
+    geom_line(linewidth = 1) +
+    geom_vline(xintercept = c(0, 1, 2, 2.75),
+               linetype = "dashed",
+               color = fr_theta_clr) +
+    geom_vline(xintercept = c(0, 1, 2, 2.75) + time.diff,
+               linetype = "dashed",
+               color = po_alpha_clr) +
+    geom_text(aes(label = event,
+                  x = time,
+                  y = 0.9),
+              data = ret_labels,
+              inherit.aes = FALSE,
+              angle = 90, 
+              hjust = 1,
+              vjust = 1.3,
+              size = 3,
+              colour = fr_theta_clr,
+              family = fontfamily) +
+    geom_text(aes(label = event,
+                  x = time,
+                  y = 0.8),
+              data = ret_labels %>% 
+                mutate(time = time + time.diff),
+              inherit.aes = FALSE,
+              angle = 90, 
+              hjust = 1,
+              vjust = 1,
+              size = 3,
+              colour = po_alpha_clr,
+              family = fontfamily) +
+    geom_rect(aes(xmin = power.clusters.of.interest %>% 
+                    dplyr::filter(power_type == "Frontal theta") %>% 
+                    group_by() %>% 
+                    summarize(xmin_start = min(start.time) - 0.05,
+                              xmin_end = max(end.time) + 0.05) %>% 
+                    ungroup() %>% 
+                    pull(xmin_start),
+                  xmax = power.clusters.of.interest %>% 
+                    dplyr::filter(power_type == "Frontal theta") %>% 
+                    group_by() %>% 
+                    summarize(xmin_start = min(start.time) - 0.05,
+                              xmin_end = max(end.time) + 0.05) %>% 
+                    ungroup() %>% 
+                    pull(xmin_end),
+                  ymin = -0.55,
+                  ymax = -0.70),
+              fill = "#e6ffb3",
+              color = NA,
+              alpha = 0.2) +
+    geom_segment(aes(x = start.time,
+                     xend = end.time,
+                     y = -0.6,
+                     yend = -0.6),
+                 data = power.clusters.of.interest %>% 
+                   dplyr::filter(power_type == "Frontal theta") %>% 
+                   dplyr::filter(cluster_type == "Memory strength (Weak v. Strong)"),
+                 linewidth = 1,
+                 color = "#1A936F") +
+    geom_segment(aes(x = start.time,
+                     xend = end.time,
+                     y = -0.65,
+                     yend = -0.65),
+                 data = power.clusters.of.interest %>% 
+                   dplyr::filter(power_type == "Frontal theta") %>% 
+                   dplyr::filter(cluster_type == "Mismatch effect x Memory strength"),
+                 linewidth = 1,
+                 color = "#FFD131") +
+    geom_rect(aes(xmin = power.clusters.of.interest %>% 
+                    dplyr::filter(power_type == "Posterior alpha") %>% 
+                    group_by() %>% 
+                    summarize(xmin_start = min(start.time) + time.diff - 0.05,
+                              xmin_end = max(end.time) + time.diff + 0.05) %>% 
+                    ungroup() %>% 
+                    pull(xmin_start),
+                  xmax = power.clusters.of.interest %>% 
+                    dplyr::filter(power_type == "Posterior alpha") %>% 
+                    group_by() %>% 
+                    summarize(xmin_start = min(start.time) + time.diff - 0.05,
+                              xmin_end = max(end.time) + time.diff + 0.05) %>% 
+                    ungroup() %>% 
+                    pull(xmin_end),
+                  ymin = -0.75,
+                  ymax = -0.90),
+              fill = "#e0dbf0",
+              color = NA,
+              alpha = 0.2) +
+    geom_segment(aes(x = start.time + time.diff,
+                     xend = end.time + time.diff,
+                     y = -0.8,
+                     yend = -0.8),
+                 data = power.clusters.of.interest %>% 
+                   dplyr::filter(power_type == "Posterior alpha") %>% 
+                   dplyr::filter(cluster_type == "Memory strength (Weak v. Strong)"),
+                 linewidth = 1,
+                 color = "#1A936F") +
+    geom_segment(aes(x = start.time + time.diff,
+                     xend = end.time + time.diff,
+                     y = -0.85,
+                     yend = -0.85),
+                 data = power.clusters.of.interest %>% 
+                   dplyr::filter(power_type == "Posterior alpha") %>% 
+                   dplyr::filter(cluster_type == "Mismatch effect x Memory strength"),
+                 linewidth = 1,
+                 color = "#FFD131") +
+    labs(x = "Time (s)",
+         y = "Power (z)",
+         title = paste("Lag:", 
+                       sprintf("%.3fs", 
+                               time.diff))) +
+         # title = paste("Lag:", 
+         #               sprintf("%.3fs [%.3f, %.3f]", 
+         #                       time.diff,
+         #                       start.time, 
+         #                       end.time))) +
+    guides(linetype = "none") + 
+    scale_color_manual(values=c(fr_theta_clr, po_alpha_clr), name="") + 
+    scale_fill_manual(values=c(fr_theta_clr, po_alpha_clr), name="") + 
+    theme(strip.text.x = element_text(size=12)) + 
+    scale_x_continuous(limits = c(-1, 4))
+  
+  print(plt)
+  
+}
+```
+

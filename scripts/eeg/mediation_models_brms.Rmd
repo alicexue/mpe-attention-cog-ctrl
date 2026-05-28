@@ -1,0 +1,597 @@
+---
+title: "EEG - pupil mediation models"
+author: "Alice M. Xue (alicexue@stanford.edu)"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 3
+    toc_float:
+      collapsed: no
+    self_contained: no
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+---
+
+```{r setup, include=FALSE}
+library(plyr)
+library(Hmisc)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+library(data.table)
+library(psycho)
+library(lme4)
+library(sjPlot)
+library(afex)
+library(viridis)
+library(showtext)
+library(tidyverse)
+library(mgcv)
+library(itsadug)
+library(RColorBrewer)
+library(ggcorrplot)
+library(devtools)
+library(factoextra)
+library(tidyjson)
+library(purrr)
+library(broom)
+library(zoo)
+library(psych)
+library(patchwork)
+library(emmeans)
+library(ggpubr)
+library(stats)
+library(broom.mixed)
+library(pracma)
+library(afex)
+library(gsignal)
+library(fuzzyjoin)
+library(brms)
+library(report)
+library(ggdist)
+
+
+font_add(family = "Avenir Next",
+         regular = "../utils/AvenirNext-Regular.ttf",
+         bold = "../utils/AvenirNext-DemiBold.ttf",
+         italic = "../utils/AvenirNext-Italic.ttf")
+showtext.auto()
+
+fontfamily <- "Avenir Next"
+
+set_theme(
+  base=theme_classic(base_size = 12,
+                     base_family="Avenir Next",
+                     base_line_size = 12/30,
+                     base_rect_size = 12/30)
+)
+
+options(dplyr.summarise.inform = FALSE)
+
+knitr::opts_chunk$set(echo = TRUE, 
+                      warning=FALSE, 
+                      message = FALSE, 
+                      fig.showtext=TRUE)
+
+knitr::opts_chunk$set(dev = 'pdf') # set output device to pdf
+
+source("../utils/summary_se_utils.R")
+```
+
+```{r get_behavior, echo=F}
+set.seed(478)
+
+fr.theta.hits <- fread("../../data/eeg/MPE_frontal_theta_asso_retrieval_Hit.csv")
+fr.theta.crs <- fread("../../data/eeg/MPE_frontal_theta_asso_retrieval_CR.csv")
+po.alpha.hits <- fread("../../data/eeg/MPE_posterior_alpha_asso_retrieval_Hit.csv")
+po.alpha.crs <- fread("../../data/eeg/MPE_posterior_alpha_asso_retrieval_CR.csv")
+
+fr.theta.power <- bind_rows(
+  list(
+    fr.theta.hits, 
+    fr.theta.crs))
+
+po.alpha.power <- bind_rows(
+  list(
+    po.alpha.hits,
+    po.alpha.crs))
+
+rm(fr.theta.hits, 
+   fr.theta.crs,
+   po.alpha.hits,
+   po.alpha.crs)
+```
+
+```{r load_pupil, echo=F}
+retrieval_pupil <- fread("../../data/pupil/MPE_imm_retrieval_pupil.csv")
+```
+
+```{r load_clusters, echo=F}
+
+if (file.exists("spectral_pupil_clusters.RData")) {
+  load("spectral_pupil_clusters.RData")
+} else {
+  print("Could not find spectral_pupil_clusters.RData")
+}
+
+pupil.pca.scores <- read.csv("../pupil/pupil_tPCA_scores_correct_trials_only.csv")
+
+recog.behavior <- read.csv("../../data/behavior/MPE_mismatch_recog_behavior.csv")
+
+exclude.subs <- c()
+
+clusters.of.interest <- clusters.all %>% 
+  dplyr::filter(comparison == "Mismatch effect x Memory strength \npupil 4 v. theta 7 v. alpha 8")
+
+```
+
+```{r retrieval_period_cluster, echo=F}
+clusters.retrieval.period <- clusters.all %>% 
+  dplyr::filter(comparison == "Memory strength (Weak v. Strong) \npupil 2 v. theta 3 v. alpha 4")
+
+clusters.retrieval.period.pupil <- clusters.retrieval.period %>% 
+  cross_join(retrieval_pupil) %>% 
+  dplyr::filter(time >= start.pupil & time <= end.pupil) %>% 
+  group_by(subjectId, 
+           trialN, 
+           trial_outcome, 
+           association_strength, 
+           match_response.rt,
+           term,
+           cluster_id.pupil,
+           comparison,
+           start.pupil,
+           end.pupil) %>% 
+  summarize(pupil_diameter_z = mean(pupil_diameter_z)) %>% 
+  ungroup()
+
+start.name <- "start.frontal_theta"
+end.name <- "end.frontal_theta"
+cluster_id.power <- "cluster_id.frontal_theta"
+clusters.fr.theta <- clusters.retrieval.period %>% 
+  cross_join(fr.theta.power) %>% 
+  dplyr::filter(time >= !!sym(start.name) & time <= !!sym(end.name)) %>% 
+  group_by(subjectId, 
+           trialN, 
+           trial_outcome, 
+           association_strength, 
+           match_response.rt,
+           term,
+           !!sym(cluster_id.power),
+           comparison,
+           !!sym(start.name),
+           !!sym(end.name)) %>%
+  summarize(frontal_theta.power = mean(power)) %>% 
+  ungroup()
+
+start.name <- "start.posterior_alpha"
+end.name <- "end.posterior_alpha"
+cluster_id.power <- "cluster_id.posterior_alpha"
+clusters.po.alpha <- clusters.retrieval.period %>% 
+  cross_join(po.alpha.power) %>% 
+  dplyr::filter(time >= !!sym(start.name) & time <= !!sym(end.name)) %>% 
+  group_by(subjectId, 
+           trialN, 
+           trial_outcome, 
+           association_strength, 
+           match_response.rt,
+           term,
+           !!sym(cluster_id.power),
+           comparison,
+           !!sym(start.name),
+           !!sym(end.name)) %>%
+  summarize(posterior_alpha.power = mean(power)) %>% 
+  ungroup()
+
+pupil.power.retrieval.period <- clusters.retrieval.period.pupil %>% 
+  left_join(clusters.fr.theta, by=c("subjectId", "trialN", "trial_outcome",
+                                    "association_strength", "term",
+                                    "comparison"),
+            suffix = c(".pupil", ".frontal_theta")) %>% 
+  left_join(clusters.po.alpha, by=c("subjectId", "trialN", "trial_outcome",
+                                    "association_strength", "term",
+                                    "comparison"),
+            suffix = c(".pupil", ".posterior_alpha")) %>% 
+  dplyr::filter(!is.na(pupil_diameter_z),
+                !is.na(frontal_theta.power),
+                !is.na(posterior_alpha.power)) %>% 
+  dplyr::filter(!subjectId %in% exclude.subs) %>% 
+  mutate(trial_condition = recode(trial_outcome,
+                                  Hit = "Match",
+                                  CR = "Mismatch")) %>% 
+  select(subjectId, 
+         trialN, 
+         frontal_theta.power, 
+         posterior_alpha.power, 
+         pupil_diameter_z) %>% 
+  dplyr::rename(fr_theta.retrieval = frontal_theta.power, 
+                po_alpha.retrieval = posterior_alpha.power,
+                pupil.retrieval = pupil_diameter_z)
+```
+
+
+```{r merge_clusters, echo=F}
+clusters.pupil <- clusters.of.interest %>% 
+  cross_join(retrieval_pupil) %>% 
+  dplyr::filter(time >= start.pupil & time <= end.pupil) %>% 
+  group_by(subjectId, 
+           trialN, 
+           trial_outcome, 
+           association_strength, 
+           match_response.rt,
+           term,
+           cluster_id.pupil,
+           comparison,
+           start.pupil,
+           end.pupil) %>% 
+  summarize(pupil_diameter_z = mean(pupil_diameter_z)) %>% 
+  ungroup()
+
+start.name <- "start.frontal_theta"
+end.name <- "end.frontal_theta"
+cluster_id.power <- "cluster_id.frontal_theta"
+clusters.fr.theta <- clusters.of.interest %>% 
+  cross_join(fr.theta.power) %>% 
+  dplyr::filter(time >= !!sym(start.name) & time <= !!sym(end.name)) %>% 
+  group_by(subjectId, 
+           trialN, 
+           trial_outcome, 
+           association_strength, 
+           match_response.rt,
+           term,
+           !!sym(cluster_id.power),
+           comparison,
+           !!sym(start.name),
+           !!sym(end.name)) %>%
+  summarize(frontal_theta.power = mean(power)) %>% 
+  ungroup()
+
+start.name <- "start.posterior_alpha"
+end.name <- "end.posterior_alpha"
+cluster_id.power <- "cluster_id.posterior_alpha"
+clusters.po.alpha <- clusters.of.interest %>% 
+  cross_join(po.alpha.power) %>% 
+  dplyr::filter(time >= !!sym(start.name) & time <= !!sym(end.name)) %>% 
+  group_by(subjectId, 
+           trialN, 
+           trial_outcome, 
+           association_strength, 
+           match_response.rt,
+           term,
+           !!sym(cluster_id.power),
+           comparison,
+           !!sym(start.name),
+           !!sym(end.name)) %>%
+  summarize(posterior_alpha.power = mean(power)) %>% 
+  ungroup()
+
+pupil.power.data <- clusters.pupil %>% 
+  left_join(clusters.fr.theta, by=c("subjectId", "trialN", "trial_outcome",
+                                    "association_strength", "term",
+                                    "comparison"),
+            suffix = c(".pupil", ".frontal_theta")) %>% 
+  left_join(clusters.po.alpha, by=c("subjectId", "trialN", "trial_outcome",
+                                    "association_strength", "term",
+                                    "comparison"),
+            suffix = c(".pupil", ".posterior_alpha")) %>% 
+  dplyr::filter(!is.na(pupil_diameter_z),
+                !is.na(frontal_theta.power),
+                !is.na(posterior_alpha.power)) %>% 
+  dplyr::filter(!subjectId %in% exclude.subs) %>% 
+  mutate(trial_condition = recode(trial_outcome,
+                                  Hit = "Match",
+                                  CR = "Mismatch")) %>% 
+  left_join(pupil.pca.scores %>% 
+              select(-X) %>% 
+              pivot_wider(names_from = "component",
+                          values_from = "component_score"),
+            by = c("subjectId", 
+                   "trialN", 
+                   "trial_outcome", 
+                   "association_strength")) %>% 
+  left_join(recog.behavior %>% 
+              select(subjectId,
+                     img, 
+                     correct.recog,
+                     recognition_response.rt))
+```
+
+
+Referencing https://thechangelab.stanford.edu/tutorials/intensive-longitudinal-analysis/specifying-1-1-1-mediation-models-r/
+
+## PC3
+
+```{r}
+
+xm <- bf(frontal_theta.power ~ -1 + match_response.rt + (-1 + match_response.rt |p| subjectId))
+my <- bf(PC3 ~ -1 + match_response.rt + frontal_theta.power + (-1 + match_response.rt + frontal_theta.power |p| subjectId))
+
+fit_brm_pupil <- brm(xm + my + set_rescor(FALSE),
+                     data = pupil.power.data %>% 
+                       dplyr::filter(association_strength == "Strong (4x)") %>% 
+                       dplyr::filter(trial_condition == "Mismatch") %>% 
+                       group_by(subjectId) %>% 
+                       mutate(frontal_theta.power = scale(frontal_theta.power),
+                              posterior_alpha.power = scale(posterior_alpha.power),
+                              pupil_diameter_z = scale(pupil_diameter_z),
+                              PC3 = scale(PC3),
+                              match_response.rt = log(match_response.rt),
+                              match_response.rt = scale(match_response.rt)) %>% 
+                       ungroup(),
+                     iter = 3000,
+                     seed = 478
+)
+
+```
+
+
+```{r}
+print(fit_brm_pupil, digits = 4)
+```
+
+
+```{r}
+## Compute the indirect effect
+
+cortocov <- function (r, var1, var2) {
+  cov=r*((var1*var2)^0.5)
+  return(cov)
+}
+
+## use the posterior_samples() function to pull out the posterior distributions for all model parameters
+## these are all possible effect sizes for each parameter
+med_post <- posterior_samples(fit_brm_pupil)
+
+# plug in SD and correlation corresponding to a and b paths for cortocov function
+
+med_post$covab <- cortocov(
+  # vector of posterior samples corresponding to correlation of a and b paths
+  med_post$cor_subjectId__frontalthetapower_match_response.rt__PC3_frontal_theta.power,
+  
+  # vector of posterior samples corresponding to SD of a path --> convert to variance
+  med_post$sd_subjectId__frontalthetapower_match_response.rt^2,
+  
+  # vector of posterior samples corresponding to SD of b path --> convert to variance
+  med_post$sd_subjectId__PC3_frontal_theta.power^2)
+
+round(mean(med_post$covab), digits = 4) 
+
+```
+
+
+```{r}
+indirect_effect <- 
+  med_post$b_frontalthetapower_match_response.rt *   # a path
+  med_post$b_PC3_frontal_theta.power +   # b path
+  med_post$covab   # cov(a, b) as calculated above
+
+round(quantile(indirect_effect, probs = c(.025, .5, .975)), digits = 3) 
+```
+
+
+```{r}
+round(mean(indirect_effect), digits = 3)
+```
+
+```{r, fig.width=3, fig.height=2}
+
+tibble(indirect_effect) %>% 
+  ggplot(aes(x=indirect_effect)) + 
+  stat_halfeye(show.legend = F, 
+               point_interval="median_hdi") + 
+  geom_vline(xintercept = 0, 
+             linetype = 2) + 
+  theme(axis.line.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.y = element_blank()) + 
+  labs(x = "Indirect effect") + 
+  xlim(-0.03, 0.08)
+
+```
+
+## Posterior alpha
+
+```{r}
+
+xm <- bf(frontal_theta.power ~ -1 + match_response.rt + (-1 + match_response.rt |p| subjectId))
+my <- bf(posterior_alpha.power ~ -1 + match_response.rt + frontal_theta.power + (-1 + match_response.rt + frontal_theta.power |p| subjectId))
+
+fit_brm_alpha <- brm(xm + my + set_rescor(FALSE),
+                     data = pupil.power.data %>% 
+                       dplyr::filter(association_strength == "Strong (4x)") %>% 
+                       dplyr::filter(trial_condition == "Mismatch") %>% 
+                       group_by(subjectId) %>% 
+                       mutate(frontal_theta.power = scale(frontal_theta.power),
+                              posterior_alpha.power = scale(posterior_alpha.power),
+                              pupil_diameter_z = scale(pupil_diameter_z),
+                              PC3 = scale(PC3),
+                              match_response.rt = log(match_response.rt),
+                              match_response.rt = scale(match_response.rt)) %>% 
+                       ungroup(),
+                     iter = 3000,
+                     seed = 478
+)
+
+```
+
+
+```{r}
+print(fit_brm_alpha, digits = 4)
+```
+
+
+```{r}
+## Compute the indirect effect
+
+cortocov <- function (r, var1, var2) {
+  cov=r*((var1*var2)^0.5)
+  return(cov)
+}
+
+## use the posterior_samples() function to pull out the posterior distributions for all model parameters
+## these are all possible effect sizes for each parameter
+med_post <- posterior_samples(fit_brm_alpha)
+
+# plug in SD and correlation corresponding to a and b paths for cortocov function
+
+med_post$covab <- cortocov(
+  # vector of posterior samples corresponding to correlation of a and b paths
+  med_post$cor_subjectId__frontalthetapower_match_response.rt__posterioralphapower_frontal_theta.power,
+  
+  # vector of posterior samples corresponding to SD of a path --> convert to variance
+  med_post$sd_subjectId__frontalthetapower_match_response.rt^2,
+  
+  # vector of posterior samples corresponding to SD of b path --> convert to variance
+  med_post$sd_subjectId__posterioralphapower_frontal_theta.power^2)
+
+round(mean(med_post$covab), digits = 4) 
+
+```
+
+
+```{r}
+indirect_effect <- 
+  med_post$b_frontalthetapower_match_response.rt *   # a path
+  med_post$b_posterioralphapower_frontal_theta.power +   # b path
+  med_post$covab   # cov(a, b) as calculated above
+
+round(quantile(indirect_effect, probs = c(.025, .5, .975)), digits = 3) 
+```
+
+
+```{r}
+round(mean(indirect_effect), digits = 3)
+```
+
+```{r, fig.width=3, fig.height=2}
+
+tibble(indirect_effect) %>% 
+  ggplot(aes(x=indirect_effect)) + 
+  stat_halfeye(show.legend = F, 
+               point_interval="median_hdi") + 
+  geom_vline(xintercept = 0, 
+             linetype = 2) + 
+  theme(axis.line.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.y = element_blank()) + 
+  labs(x = "Indirect effect") + 
+  xlim(-0.03, 0.08)
+
+```
+
+## RT --> posterior alpha --> frontal theta
+
+```{r}
+
+xm <- bf(posterior_alpha.power ~ -1 + match_response.rt + (-1 + match_response.rt |p| subjectId))
+my <- bf(frontal_theta.power ~ -1 + match_response.rt + posterior_alpha.power + (-1 + match_response.rt + posterior_alpha.power |p| subjectId))
+
+fit_brm_alpha_theta <- brm(xm + my + set_rescor(FALSE),
+                           data = pupil.power.data %>% 
+                             dplyr::filter(association_strength == "Strong (4x)") %>% 
+                             dplyr::filter(trial_condition == "Mismatch") %>% 
+                             group_by(subjectId) %>% 
+                             mutate(frontal_theta.power = scale(frontal_theta.power),
+                                    posterior_alpha.power = scale(posterior_alpha.power),
+                                    pupil_diameter_z = scale(pupil_diameter_z),
+                                    PC3 = scale(PC3),
+                                    match_response.rt = log(match_response.rt),
+                                    match_response.rt = scale(match_response.rt)) %>% 
+                             ungroup(),
+                           iter = 3000,
+                           seed = 478
+)
+
+```
+
+
+```{r}
+summary(fit_brm_alpha_theta)
+```
+
+
+```{r}
+print(fit_brm_alpha_theta, digits = 4)
+```
+
+
+```{r}
+## Compute the indirect effect
+
+cortocov <- function (r, var1, var2) {
+  cov=r*((var1*var2)^0.5)
+  return(cov)
+}
+
+## use the posterior_samples() function to pull out the posterior distributions for all model parameters
+## these are all possible effect sizes for each parameter
+med_post <- posterior_samples(fit_brm_alpha_theta)
+
+# plug in SD and correlation corresponding to a and b paths for cortocov function
+
+med_post$covab <- cortocov(
+  # vector of posterior samples corresponding to correlation of a and b paths
+  med_post$cor_subjectId__posterioralphapower_match_response.rt__frontalthetapower_posterior_alpha.power,
+  
+  # vector of posterior samples corresponding to SD of a path --> convert to variance
+  med_post$sd_subjectId__posterioralphapower_match_response.rt^2,
+  
+  # vector of posterior samples corresponding to SD of b path --> convert to variance
+  med_post$sd_subjectId__frontalthetapower_posterior_alpha.power^2)
+
+round(mean(med_post$covab), digits = 4) 
+
+```
+
+
+```{r}
+indirect_effect <- 
+  med_post$b_posterioralphapower_match_response.rt *   # a path
+  med_post$b_frontalthetapower_posterior_alpha.power +   # b path
+  med_post$covab   # cov(a, b) as calculated above
+
+round(quantile(indirect_effect, probs = c(.025, .5, .975)), digits = 3) 
+```
+
+
+```{r}
+round(mean(indirect_effect), digits = 3)
+```
+
+```{r, fig.width=3, fig.height=2}
+
+tibble(indirect_effect) %>% 
+  ggplot(aes(x=indirect_effect)) + 
+  stat_halfeye(show.legend = F, 
+               point_interval="median_hdi") + 
+  geom_vline(xintercept = 0, 
+             linetype = 2) + 
+  theme(axis.line.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.y = element_blank()) + 
+  labs(x = "Indirect effect") + 
+  xlim(-0.03, 0.08)
+
+```
+
+## Comparison
+
+```{r}
+
+loo1 <- loo(fit_brm_alpha)
+loo2 <- loo(fit_brm_alpha_theta)
+loo_compare(loo1, loo2)
+
+comparison <- loo_compare(loo1,
+                          loo2)
+
+print(comparison, simplify = F, digits=3)
+
+report(comparison)
+```
+

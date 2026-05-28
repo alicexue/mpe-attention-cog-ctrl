@@ -19,7 +19,6 @@ output:
 
 ```{r setup, include=FALSE}
 library(plyr)
-library(tidymv)
 library(Hmisc)
 library(ggplot2)
 library(knitr)
@@ -51,6 +50,7 @@ library(broom.mixed)
 library(pracma)
 library(afex)
 library(stringr)
+library(ggeffects)
 
 font_add(family = "Avenir Next",
          regular = "../utils/AvenirNext-Regular.ttf",
@@ -651,10 +651,15 @@ for (i in 1:ncomp) {
   print(paste("No mismatch compact model failed to converge: ",
               isSingular(mod.no.mismatch) | any(grepl("failed to converge", mod.no.mismatch@optinfo$conv$lme4$messages))))
   
-  emm <- emmeans(mod, ~ is_mismatch | association_strength, adjust="bonferroni")
+  emm <- emmeans(mod, ~ is_mismatch | association_strength, lmerTest.limit = 10346)
+  print(emm)
+  tidy(emm, effects = "fixed", conf.int = T, conf.level = 0.95) %>% 
+    kable(digits=3, caption=paste("PC", i, "; Emmeans", sep="")) %>% 
+    kable_styling() %>% 
+    cat()
   emm.pairs <- pairs(emm)
+  print(emm.pairs)
   tidy(emm.pairs, effects = "fixed", conf.int = T, conf.level = 0.95) %>% 
-    select(association_strength, contrast, estimate, conf.low, conf.high, p.value, std.error) %>% 
     kable(digits=3, caption=paste("PC", i, "; Pairwise comparisons", sep="")) %>% 
     kable_styling() %>% 
     cat()
@@ -797,9 +802,6 @@ rt.binned.plt <- rt_data %>%
                                "component",
                                "component_score_bin"), 
                   idvar="subjectId") %>% 
-  # mutate(across(component,
-  #               factor,
-  #               levels=ordered_pcs)) %>% 
   ggplot(aes(x = as.numeric(as.character(component_score_bin)),
              y = rt,
              color = trial_outcome,
@@ -913,9 +915,9 @@ for (pc in 1:ncomp) {
     kable_styling() %>% 
     cat()
   
-  slopes <- emtrends(mod, pairwise ~ association_strength * trial_outcome, var = "component_score")
+  slopes <- emtrends(mod, pairwise ~ association_strength * trial_outcome, var = "component_score", lmerTest.limit = 10346)
   
-  print("Degrees-of-freedom method: asymptotic P value adjustment: tukey method for comparing a family of 4 estimates")
+  print(slopes)
   
   tidy(slopes$emtrends, conf.int = T, conf.level = 0.95) %>% 
     kable(caption=paste("slopes: RT ~ ", title, sep=""),
@@ -2137,8 +2139,12 @@ showtext_opts(op)
 
 ```{r submem_hist, echo=F, eval=T}
 palette <- c("#59735e", "#b7c8ba")
+palette <- c("#008080", "#9fdfbf")
+
+subs.exclude <- c("MPE514", "MPE527") # insufficient number of trials
 
 subj.data.submem <- subj.data.scores %>% 
+  dplyr::filter(!subjectId %in% subs.exclude) %>% 
   left_join(recognition_behavior,
             by = c("subjectId", "expId", "img"),
             suffix = c(".retrieval", ".recognition")) %>%
@@ -2146,91 +2152,72 @@ subj.data.submem <- subj.data.scores %>%
   dplyr::filter(trial_outcome.retrieval == "CR") %>% 
   mutate(across(trial_outcome.recognition, 
                 factor, 
-                levels=c("Hit", "Miss")))
-```
-
-```{r same_tempPCA_submem, echo=F, fig.width=10, fig.height=12, eval=T}
-
-submem.plt <- subj.data.submem %>%
-  group_by(subjectId, association_strength, trial_outcome.recognition, component, expId) %>% 
-  summarize(component_score = mean(component_score)) %>% 
-  summarySEwithin(., 
-                  measurevar="component_score", 
-                  withinvars=c("association_strength",
-                               "trial_outcome.recognition",
-                               "component"), 
-                  betweenvars=c("expId"),
-                  idvar="subjectId") %>% 
-  mutate(across(component,
-                factor,
-                levels=ordered_pcs)) %>%
-  ggplot(aes(x = association_strength,
-             y = component_score,
-             fill = trial_outcome.recognition)) +
-  stat_summary(fun = "mean", 
-               geom = "bar", 
-               color = "black", 
-               position=position_dodge()) +
-  geom_errorbar(aes(ymin=component_score-se, ymax=component_score+se),
-                position=position_dodge(.9), 
-                width=.2) +
-  scale_color_manual(values=hit_miss_palette, name="") +
-  scale_fill_manual(values=hit_miss_palette, name="") +
-  labs(x = "", y = "PC score") +
-  theme(strip.text.y = element_blank()) + 
-  facet_grid(rows = vars(component),
-             cols = vars(expId))
-
-loadings.vrt.plt + submem.plt + 
-  plot_layout(widths=c(1,2,2)) 
-
+                levels=c("Hit", "Miss"))) %>% 
+  mutate(trial_outcome.recognition = recode(trial_outcome.recognition, 
+                                            "Hit" = 1,
+                                            "Miss" = 0)) %>% 
+  group_by(subjectId, component) %>% 
+  mutate(component_score = scale(component_score)) %>% 
+  ungroup() %>% 
+  mutate(expId = recode(expId, 
+                        "imm" = "Experiment 1 (same day)",
+                        "del" = "Experiment 2 (48 hrs later)"))
 ```
 
 ### Models
 
 ```{r recog_models, echo=F, results="asis", eval=run_models}
-
-recog.lmer.models <- list()
+recog.glmer.models <- list()
 
 for (i in 1:ncomp) {
   mod.data <- subj.data.submem %>%
     dplyr::filter(component == paste("PC", i, sep=""))
   
   mod <- mod.data %>% 
-    lmer(component_score ~ trial_outcome.recognition * association_strength * expId + 
-           (trial_outcome.recognition * association_strength | subjectId),
-         data = .)
+    glmer(trial_outcome.recognition ~ component_score * association_strength * expId + 
+            (component_score * association_strength | subjectId),
+          data = .)
   
   if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
     mod <- mod.data %>% 
-      lmer(component_score ~ trial_outcome.recognition * association_strength * expId + 
-             (trial_outcome.recognition + association_strength + expId | subjectId),
-           data = .)
+      glmer(trial_outcome.recognition ~ component_score * association_strength * expId + 
+              (component_score + association_strength | subjectId),
+            family = "binomial",
+            data = .)
   }
   
   if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
     mod <- mod.data %>% 
-      lmer(component_score ~ trial_outcome.recognition * association_strength * expId + 
-             (1 | subjectId),
-           data = .)
+      glmer(trial_outcome.recognition ~ component_score * association_strength * expId + 
+              (component_score | subjectId),
+            family = "binomial",
+            data = .)
+  }
+  
+  if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+    mod <- mod.data %>% 
+      glmer(trial_outcome.recognition ~ component_score * association_strength * expId + 
+              (1 | subjectId),
+            family = "binomial",
+            data = .)
   }
   
   if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
     print("MODEL DID NOT CONVERGE") 
   }
   
-  recog.lmer.models[[i]] <- mod 
+  recog.glmer.models[[i]] <- mod 
 }
 
 ```
 
-```{r show_recog_mods, echo=F, results="asis"}
+```{r show_recog_mods, echo=F, results="asis", fig.height=3, fig.width=6}
 
 for (i in 1:ncomp) {
-  mod <- recog.lmer.models[[i]]
+  mod <- recog.glmer.models[[i]]
   
-  tidy(mod, effects = "fixed", conf.int = T, conf.level = 0.95) %>% 
-    select(term, estimate, conf.low, conf.high, p.value, std.error, df) %>% 
+  tidy(mod, effects = "fixed", conf.int = T, conf.level = 0.95, exponentiate=T) %>% 
+    # select(term, estimate, conf.low, conf.high, p.value, std.error, df) %>% 
     kable(caption=paste("PC", i, ": ", formula(mod)[3], sep=""),
           digits=3) %>% 
     kable_styling() %>%
@@ -2242,13 +2229,133 @@ for (i in 1:ncomp) {
     kable_styling() %>% 
     cat()
   
-  emm <- emmeans(mod, ~ trial_outcome.recognition | association_strength | expId, adjust="bonferroni")
-  emm.pairs <- pairs(emm)
-  tidy(emm.pairs, effects = "fixed", conf.int = T, conf.level = 0.95) %>% 
-    select(expId, association_strength, contrast, estimate, conf.low, conf.high, p.value, std.error) %>% 
-    kable(digits=3) %>% 
-    kable_styling() %>% 
-    cat()
+  if (i == 1) {
+    slopes <- emtrends(mod, pairwise ~ association_strength * expId, var = "component_score")
+    
+    print(slopes)
+    
+    title <- formula(mod)[3]
+    
+    tidy(slopes$emtrends, conf.int = T, conf.level = 0.95) %>% 
+      kable(caption=paste("slopes: remember ~ ", title, sep=""),
+            digits=3) %>% 
+      kable_styling() %>% 
+      cat()
+    
+    tidy(slopes$contrasts, conf.int = T, conf.level = 0.95) %>% 
+      select(contrast, estimate, std.error, df, conf.low, conf.high, statistic, adj.p.value) %>% 
+      kable(caption=paste("slope contrasts: remember ~ ", title, sep=""),
+            digits=3) %>% 
+      kable_styling() %>% 
+      cat()
+  }
+  
+  plt <- mod %>% 
+    plot_model(type="pred",
+               terms=c("component_score[all]",
+                       "association_strength[Strong (4x), Weak (1x)]",
+                       "expId"),
+               show.data=F) +
+    scale_color_manual(values=palette, name="") +
+    scale_fill_manual(values=palette, name="") +
+    scale_y_continuous(limits = c(0, 1)) +
+    labs(y = "P(remember probe)",
+         x = paste("PC", i, " score (z)", sep=""),
+         title = paste("PC", i, sep="")) + 
+    theme(plot.subtitle = element_text(size = 12))
+  
+  print(plt)
+  
+  nbins <- 4
+  
+  submem.summary <- subj.data.submem %>%
+    dplyr::filter(component == paste("PC", i, sep="")) %>% 
+    group_by(subjectId, association_strength, expId) %>%
+    mutate(component_score_bin = cut(component_score,
+                                     breaks = nbins,
+                                     labels = F)) %>%
+    ungroup() %>%
+    group_by(subjectId, component_score_bin, association_strength, expId) %>%
+    summarize(component_score = mean(component_score),
+              prob.remember = mean(trial_outcome.recognition)) %>%
+    ungroup() %>%
+    group_by(component_score_bin, association_strength, expId) %>%
+    mutate(component_score_mean = mean(component_score)) %>%
+    ungroup() %>% 
+    mutate(component_score_mean = as.numeric(component_score_mean)) %>% 
+    summarySEwithin(., 
+                    measurevar="prob.remember", 
+                    withinvars=c("association_strength",
+                                 "component_score_mean"), 
+                    betweenvars=c("expId"),
+                    idvar="subjectId") %>% 
+    mutate(component_score_mean = as.numeric(as.character(component_score_mean)))
+  
+  pred <- data.frame(ggpredict(mod, terms = c("component_score[all]",
+                                   "association_strength[Strong (4x), Weak (1x)]",
+                                   "expId"))) %>% 
+    rename(component_score_mean = x,
+           association_strength = group,
+           expId = facet)
+  
+  plt <- ggplot() +
+    geom_ribbon(data = as.data.frame(pred),
+                aes(x = component_score_mean, 
+                    ymin = conf.low, 
+                    ymax = conf.high, 
+                    fill = association_strength),
+                alpha = 0.2, color = NA) +
+    geom_line(data = as.data.frame(pred),
+              aes(x = component_score_mean, 
+                  y = predicted, 
+                  color = association_strength),
+              linewidth = 1) +
+    geom_point(data = submem.summary,
+               aes(x = component_score_mean,
+                   y = prob.remember,
+                   color = association_strength),
+               size = 1.5) +
+    geom_errorbar(data = submem.summary,
+                  aes(x = component_score_mean,
+                      ymin = prob.remember - se,
+                      ymax = prob.remember + se,
+                      color = association_strength),
+                  width = 0.2) +
+    facet_wrap(~ expId) +   
+    scale_color_manual(values = palette, name = "") +
+    scale_fill_manual(values = palette, name = "") +
+    scale_y_continuous(limits = c(0, 1)) +
+    labs(y = "P(remember probe)",
+         x = paste("PC", i, " score (z)", sep=""),
+         title = paste("PC", i, sep = "")) +
+    theme(strip.text.x = element_text(size=12))
+  
+  print(plt)
+  
+  showtext_opts(dpi = 300)
+  ggsave(paste("submem_figures/submem_PC", i, ".pdf", sep=""),
+         plot=plt,
+         width=17,
+         height=8,
+         dpi=300,
+         create.dir=T,
+         units="cm")
+  showtext_opts(op)
+  
+  # print(mod %>% 
+  #         plot_model(type="pred",
+  #                    pred.type = "re",
+  #                    terms=c("component_score",
+  #                            "subjectId",
+  #                            "expId",
+  #                            "association_strength"
+  #                    ),
+  #                    ci.lvl = NA,
+  #                    show.data=F,
+  #                    color = "gray",
+  #                    line.size = 0.2) + 
+  #         scale_y_continuous(limits = c(0, 1)) +
+  #         theme(legend.position = "none"))
   
 }
 
@@ -2260,11 +2367,7 @@ for (i in 1:ncomp) {
 ```{r rt_data_submem, echo=F}
 ### joint plot
 rt_data.submem <- subj.data.submem %>%
-  mutate(trial_outcome.recognition = as.character(trial_outcome.recognition)) %>% 
-  dplyr::filter(trial_outcome.recognition %in% c("Hit")) %>% 
-  # mutate(across(association_strength, 
-  #                 factor, 
-  #                 levels=c("Weak (1x)", "Strong (4x)"))) %>% 
+  dplyr::filter(trial_outcome.recognition == 1) %>% 
   mutate(across(association_strength, 
                 factor, 
                 levels=c("Strong (4x)", "Weak (1x)")))
@@ -2390,157 +2493,6 @@ for (pc in 1:ncomp) {
 }
 ```
 
-## Joint plot
-
-```{r submem_joint_plt, echo=F, fig.width=9, fig.height=10, eval=T}
-loadings.vrt.plt + 
-  (submem.plt + 
-     theme(legend.position="none")) +
-  rt.binned.plt +
-  plot_layout(widths=c(1,1,1))
-```
-
-
-## Individual PC plots
-
-```{r indivi_pc_plots_submem_mod, fig.width=6, fig.height=2, echo=F, eval=T}
-showtext_opts(dpi = 300)
-for (pc in 1:ncomp) {
-  fig1 <- pca.loadings %>% 
-    dplyr::filter(component == paste("PC", pc, sep="")) %>% 
-    mutate(component = paste(component, ": ", round(percent_var_explained, 2),
-                             "%",
-                             sep = "")) %>% 
-    ggplot(aes(x = time, 
-               y = loading,
-               color = component,
-               fill = component)) +
-    geom_vline(xintercept = c(0, 1, 2, 2.75),
-               linetype = "dashed",
-               color = "gray37") +
-    geom_line(color="black", linewidth=1) +
-    geom_text(aes(label = event,
-                  x = time,
-                  y = 0.75),
-              data = ret_labels,
-              inherit.aes = FALSE,
-              angle = 90, 
-              hjust = 1,
-              vjust = 1.2,
-              size = 3,
-              colour = "gray37",
-              family = fontfamily) + 
-    facet_wrap(~component) +
-    ylim(-0.25, 1) +
-    labs(x = "Time (s)",
-         y = "PC loading") +
-    scale_color_brewer(palette="Set2") + 
-    scale_fill_brewer(palette="Set2") +
-    theme(legend.position = "none",
-          strip.text.x = element_text(size=12))
-  
-  fig2 <- subj.data.submem %>%
-    dplyr::filter(component == paste("PC", pc, sep="")) %>% 
-    group_by(subjectId, association_strength, trial_outcome.recognition, component, expId) %>% 
-    summarize(component_score = mean(component_score)) %>% 
-    summarySEwithin(., 
-                    measurevar="component_score", 
-                    withinvars=c("association_strength",
-                                 "trial_outcome.recognition",
-                                 "component"), 
-                    betweenvars=c("expId"),
-                    idvar="subjectId") %>% 
-    mutate(across(component,
-                  factor,
-                  levels=ordered_pcs)) %>%
-    ggplot(aes(x = trial_outcome.recognition,
-               y = component_score,
-               fill = association_strength)) +
-    stat_summary(fun = "mean", 
-                 geom = "bar", 
-                 color = "black", 
-                 position=position_dodge()) +
-    geom_errorbar(aes(ymin=component_score-se, ymax=component_score+se),
-                  position=position_dodge(.9), 
-                  width=.2) +
-    facet_wrap(~component, scales = "free", ncol=1) +
-    scale_color_manual(values=palette, name="") +
-    scale_fill_manual(values=palette, name="") +
-    labs(x = "", y = "PC score") +
-    theme(#strip.text.x = element_blank(),
-          strip.text.y = element_blank()) + 
-    facet_grid(cols = vars(expId))
-  
-  fig3 <- rt_data.submem %>% 
-    dplyr::filter(component == paste("PC", pc, sep="")) %>% 
-    mutate(trial_outcome = trial_outcome.recognition) %>% 
-    mutate(across(association_strength, 
-                  factor, 
-                  levels=c("Strong (4x)", "Weak (1x)"))) %>% 
-    group_by(subjectId, component, association_strength, trial_outcome, expId) %>%
-    mutate(trial_count = n()) %>%
-    ungroup() %>%
-    dplyr::filter(trial_count > nbins-1) %>%
-    group_by(subjectId, component, association_strength, trial_outcome, expId) %>% 
-    mutate(component_score_bin = cut_interval(component_score, 
-                                              n = nbins,
-                                              labels = F)) %>% 
-    ungroup() %>% 
-    group_by(subjectId, trial_outcome, association_strength,
-             component, component_score_bin, expId) %>% 
-    summarize(rt = median(recognition_response.rt)) %>% 
-    summarySEwithin(., 
-                    measurevar="rt", 
-                    withinvars=c("association_strength",
-                                 "trial_outcome",
-                                 "component",
-                                 "component_score_bin"), 
-                    betweenvars=c("expId"),
-                    idvar="subjectId") %>% 
-    mutate(across(component,
-                  factor,
-                  levels=ordered_pcs)) %>%
-    ggplot(aes(x = as.numeric(as.character(component_score_bin)),
-               y = rt,
-               color = association_strength,
-               group = association_strength)) +
-    geom_line(linewidth=0.8) +
-    geom_point(size=1.5) +
-    geom_errorbar(aes(ymin=rt-se, ymax=rt+se),
-                  width=0.2) +
-    facet_grid(rows=vars(component), 
-               axes="all",
-               scales = "free") +
-    scale_color_manual(values=palette, name="") +
-    scale_fill_manual(values=palette, name="") +
-    labs(x = "PC score quartile", y = "RT (s)") +
-    guides(color="none") + 
-    theme(#strip.text.x = element_blank(),
-          strip.text.y = element_blank()) +
-    facet_grid(cols = vars(expId))
-  
-  joint.fig <- (fig1 + fig2 + fig3) +
-    plot_layout(widths=c(1,2,2), 
-                guides="collect", axes = "collect", axis_titles = "collect") &
-    theme(strip.text.y = element_blank(),
-          strip.background = element_blank(),
-          text = element_text(size = 10),
-    )
-  
-  joint.fig %>% 
-    print()
-  
-  ggsave(paste("tPCA_figures_correct_only/submem_PC", pc, "_scores_and_RT.pdf", sep=""),
-         plot=joint.fig,
-         width=22, 
-         height=7, 
-         dpi=300,
-         create.dir=T,
-         units="cm")
-}
-showtext_opts(op)
-```
-
 
 ## Save
 
@@ -2548,7 +2500,7 @@ showtext_opts(op)
 save(models, 
      models.compact.no.mismatch, 
      models.rt, 
-     recog.lmer.models,
+     recog.glmer.models,
      models.recog.rt,
      file="tpca_models_correct_only.RData")
 

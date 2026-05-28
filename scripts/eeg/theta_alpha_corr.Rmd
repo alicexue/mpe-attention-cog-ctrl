@@ -16,7 +16,6 @@ output:
 
 ```{r setup, include=FALSE}
 library(plyr)
-library(tidymv)
 library(Hmisc)
 library(ggplot2)
 library(knitr)
@@ -155,6 +154,7 @@ frontal.theta.power.clusters <- clusters.power %>%
            term,
            cluster_id.frontal_theta,
            comparison,
+           match_response.rt,
            start.frontal_theta,
            end.frontal_theta) %>%
   summarize(power = mean(power)) %>% 
@@ -170,6 +170,7 @@ posterior.alpha.power.clusters <- clusters.power %>%
            term,
            cluster_id.posterior_alpha,
            comparison,
+           match_response.rt,
            start.posterior_alpha,
            end.posterior_alpha) %>%
   summarize(power = mean(power)) %>% 
@@ -181,7 +182,8 @@ both.power.data <- frontal.theta.power.clusters %>%
                                                  "trial_outcome",
                                                  "association_strength", 
                                                  "term",
-                                                 "comparison"
+                                                 "comparison",
+                                                 "match_response.rt"
   ),
   suffix = c(".theta", ".alpha"))
 
@@ -517,6 +519,44 @@ for (this.comparison in comparisons.of.interest) {
           digits=3) %>% 
     kable_styling() %>% 
     cat()
+  
+  ####
+  if (this.comparison == "Memory strength (Weak v. Strong) \n frontal theta 3 v. posterior alpha 4") {
+    
+    mod <- mod.data %>%
+      mutate(match_response.rt = log(match_response.rt)) %>% 
+      lmer(match_response.rt ~ power.alpha * power.theta * association_strength * trial_outcome +
+             (power.alpha * power.theta * association_strength | subjectId),
+           data = .)
+    
+    if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+      mod <- mod.data %>%
+        mutate(match_response.rt = log(match_response.rt)) %>% 
+        lmer(match_response.rt ~ power.alpha * power.theta * association_strength * trial_outcome +
+               (power.alpha + power.theta + association_strength | subjectId),
+             data = .)
+    }
+    
+    if (isSingular(mod) | any(grepl("failed to converge", mod@optinfo$conv$lme4$messages))) {
+      mod <- mod.data %>%
+        mutate(match_response.rt = log(match_response.rt)) %>% 
+        lmer(match_response.rt ~ power.alpha * power.theta * association_strength * trial_outcome +
+               (1 | subjectId),
+             data = .)
+    }
+    
+    title <- formula(mod)[3]
+    
+    tidy(mod, effects = "fixed", conf.int = T, conf.level = 0.95) %>%
+      select(term, estimate, conf.low, conf.high, p.value, std.error, df) %>%
+      kable(caption=paste(this.comparison, ": ", formula(mod)[3], sep=""),
+            digits=3) %>%
+      kable_styling() %>%
+      cat()
+    
+    plt <- plot_model(mod, terms = c("power.theta", "power.alpha"), type="pred")
+    print(plt)
+  }
 }
 ```
 
